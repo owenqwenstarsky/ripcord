@@ -525,18 +525,6 @@ function RipCordApp() {
           <MenuIcon size={19} />
         </button>
         <Logo />
-        <span className="top-divider" />
-        <span className="top-instance">
-          <span className="live-dot" />
-          {workspace.instance.name}
-        </span>
-        <span className="top-right">
-          YOUR PEOPLE. YOUR SPACE.
-          <span
-            className={`connection-dot ${connected ? 'online' : ''}`}
-            title={connected ? 'Connected' : 'Reconnecting'}
-          />
-        </span>
       </div>
       {navOpen && (
         <button
@@ -753,13 +741,6 @@ function RipCordApp() {
                   </button>
                 );
               })}
-              {!workspace.dms.length && (
-                <p className="sidebar-empty">
-                  A conversation starts with hello.
-                  <br />
-                  Find a friend to get started.
-                </p>
-              )}
             </>
           )}
         </div>
@@ -767,7 +748,7 @@ function RipCordApp() {
           <Avatar user={user!} size="small" online={connected} />
           <div>
             <strong>{user!.displayName}</strong>
-            <span>{connected ? 'All good. You’re connected.' : 'Reconnecting…'}</span>
+            {!connected && <span>Reconnecting…</span>}
           </div>
           <Menu label="Account menu" trigger={<Settings size={18} />}>
             <MenuItem onClick={() => setModal('account-settings')}>
@@ -821,10 +802,12 @@ function RipCordApp() {
             <>
               <Users size={22} />
               <strong>{server ? server.name : 'Friends'}</strong>
-              <span className="header-divider" />
-              <span className="channel-topic">
-                {server ? 'Make yourself at home.' : 'Good company is always close by.'}
-              </span>
+              {server && (
+                <>
+                  <span className="header-divider" />
+                  <span className="channel-topic">Make yourself at home.</span>
+                </>
+              )}
             </>
           )}
           <div className="header-actions">
