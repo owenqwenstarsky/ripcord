@@ -212,22 +212,13 @@ h3 {
   width: 35px;
   height: 35px;
 }
-.live-dot,
-.connection-dot {
+.live-dot {
   display: inline-block;
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: var(--green);
   flex-shrink: 0;
-}
-.connection-dot {
-  background: var(--muted);
-  width: 7px;
-  height: 7px;
-}
-.connection-dot.online {
-  background: var(--green);
 }
 .eyebrow {
   font-size: 10px;
@@ -376,18 +367,6 @@ h3 {
   width: 100%;
   padding: 50px 0 0;
 }
-.auth-story h1 {
-  font-size: clamp(36px, 3.5vw, 62px);
-  line-height: 1.12;
-  font-weight: 650;
-  letter-spacing: -0.045em;
-  margin: 24px 0 19px;
-}
-.auth-story-body > p {
-  font-size: 17px;
-  line-height: 1.7;
-  color: var(--secondary);
-}
 .auth-story footer {
   display: flex;
   align-items: center;
@@ -497,22 +476,6 @@ h3 {
   justify-content: center;
   min-height: 100svh;
 }
-.auth-instance {
-  position: absolute;
-  top: 42px;
-  right: 44px;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  color: var(--secondary);
-  font-size: 12px;
-}
-.auth-instance > span:last-child {
-  font-size: 8px;
-  color: var(--muted);
-  letter-spacing: 0.09em;
-  margin-left: 4px;
-}
 .auth-form {
   width: 100%;
   max-width: 365px;
@@ -568,27 +531,6 @@ h3 {
   font-size: 11px;
   color: var(--secondary);
 }
-.auth-form .auth-fine-print {
-  font-size: 10px;
-  text-align: center;
-  color: var(--muted);
-  line-height: 1.7;
-  margin: 33px 0 0;
-}
-.auth-bottom {
-  position: absolute;
-  bottom: 27px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 10px;
-  color: var(--muted);
-}
-.auth-bottom svg {
-  height: 19px;
-  width: 19px;
-  color: var(--muted);
-}
 .recovery-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -629,27 +571,6 @@ h3 {
 .app-top .brand svg {
   width: 20px;
   height: 20px;
-}
-.top-divider {
-  height: 13px;
-  width: 1px;
-  background: var(--line);
-}
-.top-instance {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  color: var(--secondary);
-  font-size: 10px;
-}
-.top-right {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  font-size: 8px;
-  letter-spacing: 0.13em;
-  color: var(--muted);
-  margin-left: auto;
 }
 .server-rail {
   background: var(--rail);
@@ -1034,12 +955,6 @@ h3 {
   border-radius: 9px;
   color: var(--accent);
   flex-shrink: 0;
-}
-.sidebar-empty {
-  font-size: 11px;
-  color: var(--muted);
-  padding: 12px;
-  line-height: 1.8;
 }
 .main-pane {
   background: var(--surface);
@@ -2694,9 +2609,6 @@ h3 {
   .auth-story {
     padding: 35px;
   }
-  .auth-story h1 {
-    font-size: 42px;
-  }
   .art-message {
     font-size: 10px;
     padding: 11px;
@@ -2732,9 +2644,6 @@ h3 {
   .auth-layout {
     grid-template-columns: 45% 55%;
   }
-  .auth-story h1 {
-    font-size: 34px;
-  }
   .auth-story footer a {
     display: none;
   }
@@ -2749,9 +2658,6 @@ h3 {
   }
   .orbit-three {
     width: 370px;
-  }
-  .auth-story-body > p {
-    font-size: 14px;
   }
   .message-actions {
     opacity: 1;
@@ -2796,14 +2702,6 @@ h3 {
     padding: 25px 25px 60px;
     justify-content: flex-start;
   }
-  .auth-instance {
-    top: -51px;
-    right: 25px;
-    font-size: 9px;
-  }
-  .auth-instance > span:last-child {
-    display: none;
-  }
   .auth-form {
     margin: 25px 0 35px;
     max-width: 380px;
@@ -2824,16 +2722,6 @@ h3 {
   }
   .app-top .brand {
     font-size: 15px;
-  }
-  .top-divider {
-    display: none;
-  }
-  .top-instance {
-    font-size: 9px;
-    margin-left: auto;
-  }
-  .top-right {
-    display: none;
   }
   .mobile-menu {
     display: flex;

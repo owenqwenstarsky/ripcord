@@ -1,6 +1,6 @@
 'use client';
 import { useState } from 'react';
-import { ArrowRight, Check, LockKeyhole, Users, MessageCircle, ArrowUpRight } from 'lucide-react';
+import { ArrowRight, Check, Users, MessageCircle, ArrowUpRight } from 'lucide-react';
 import { Logo, api, ErrorNote } from './ui';
 type PublicInfo = {
   name: string;
@@ -70,18 +70,6 @@ export function AuthScreen({ info, onLogin }: { info: PublicInfo; onLogin: () =>
       <section className="auth-story">
         <Logo />
         <div className="auth-story-body">
-          <span className="eyebrow">
-            <span className="live-dot" /> A SPACE OF YOUR OWN
-          </span>
-          <h1>
-            Good company.
-            <br />
-            Great conversations.
-          </h1>
-          <p>
-            A little closer to your people.
-            <br />A little more in your control.
-          </p>
           <div className="cord-art" aria-hidden="true">
             <div className="cord-orbit orbit-one" />
             <div className="cord-orbit orbit-two" />
@@ -99,17 +87,12 @@ export function AuthScreen({ info, onLogin }: { info: PublicInfo; onLogin: () =>
           </div>
         </div>
         <footer>
-          <LockKeyhole size={15} />
-          <span>Self-hosted. Independent. Yours.</span>
           <a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noreferrer">
             Open source <ArrowUpRight size={13} />
           </a>
         </footer>
       </section>
       <section className="auth-form-side">
-        <div className="auth-instance">
-          <span className="live-dot" /> {info.name} <span>INSTANCE</span>
-        </div>
         {codes.length ? (
           <div className="auth-form">
             <div className="welcome-icon">
@@ -320,16 +303,8 @@ export function AuthScreen({ info, onLogin }: { info: PublicInfo; onLogin: () =>
                 </button>
               </div>
             )}
-            <p className="auth-fine-print">
-              Conversations stay on this instance.
-              <br />
-              Connect with people, on your terms.
-            </p>
           </form>
         )}
-        <footer className="auth-bottom">
-          A better place to hang out. <Logo small />
-        </footer>
       </section>
     </main>
   );
