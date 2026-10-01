@@ -3004,3 +3004,101 @@ h3 {
     scroll-behavior: auto !important;
   }
 }
+
+/* Functional focus, historical navigation, and touch controls. */
+fieldset {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}
+.settings-fieldset {
+  width: 100%;
+}
+fieldset:disabled {
+  opacity: 0.7;
+}
+.message-target {
+  background: var(--accent-soft, #8580ff25);
+  outline: 2px solid var(--accent, #8580ff);
+  outline-offset: -2px;
+}
+.message-reply {
+  text-align: left;
+  cursor: pointer;
+}
+.jump-latest {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px;
+  min-height: 32px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  color: var(--secondary);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.5;
+}
+.jump-latest:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.person-result[aria-selected='true'] {
+  background: #8580ff25;
+  outline: 1px solid #8580ff;
+}
+.members-backdrop {
+  display: none;
+}
+@media (max-width: 900px) {
+  .members-backdrop {
+    display: block;
+    position: fixed;
+    inset: 99px 0 0;
+    border: 0;
+    background: #0005;
+    z-index: 24;
+  }
+  .message-actions > button:first-child,
+  .message-actions > .icon-button {
+    display: flex;
+  }
+  .message-byline {
+    padding-right: 95px;
+  }
+  .message-actions .icon-button {
+    min-height: 32px;
+    width: 32px;
+  }
+}
+@media (max-width: 680px) {
+  .header-actions .icon-button:first-child {
+    display: flex;
+  }
+  .header-actions {
+    flex-shrink: 0;
+  }
+  .chat-header > strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .members-sidebar {
+    position: fixed;
+    top: 95px;
+    bottom: 0;
+    right: 0;
+  }
+  .members-backdrop {
+    top: 95px;
+  }
+  .management-form .row-actions,
+  .form-columns {
+    flex-wrap: wrap;
+  }
+  .row-actions {
+    flex-wrap: wrap;
+  }
+}

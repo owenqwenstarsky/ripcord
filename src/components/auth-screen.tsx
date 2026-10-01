@@ -1,6 +1,13 @@
 'use client';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ArrowRight, Check, Users, MessageCircle, ArrowUpRight } from 'lucide-react';
+import {
+  invitationCode,
+  pendingInvitation,
+  rememberInvitation,
+  clearInvitation,
+} from '@/lib/invitations';
+import type { Invitation } from '@/lib/types';
 import { Logo, api, ErrorNote } from './ui';
 type PublicInfo = {
   name: string;
@@ -23,8 +30,45 @@ export function AuthScreen({ info, onLogin }: { info: PublicInfo; onLogin: () =>
     [busy, setBusy] = useState(false),
     [notice, setNotice] = useState(''),
     [codes, setCodes] = useState<string[]>([]);
+  const submission = useRef(false);
+  const [invite, setInvite] = useState(() =>
+    typeof window === 'undefined' ? '' : pendingInvitation(),
+  );
+  const [preview, setPreview] = useState<Invitation | null>(null),
+    [inviteError, setInviteError] = useState('');
+  useEffect(() => {
+    const code = invitationCode(invite);
+    if (!code) {
+      setPreview(null);
+      setInviteError('');
+      return;
+    }
+    rememberInvitation(code);
+    let active = true;
+    const timer = setTimeout(() => {
+      void api<Invitation>(`invites/${encodeURIComponent(code)}`)
+        .then((result) => {
+          if (active) {
+            setPreview(result);
+            setInviteError('');
+          }
+        })
+        .catch((error) => {
+          if (active) {
+            setPreview(null);
+            setInviteError(error.message);
+          }
+        });
+    }, 250);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [invite]);
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (submission.current) return;
+    submission.current = true;
     setBusy(true);
     setError('');
     const form = new FormData(event.currentTarget);
@@ -35,19 +79,26 @@ export function AuthScreen({ info, onLogin }: { info: PublicInfo; onLogin: () =>
       if (mode !== 'forgot' && mode !== 'verify') data.password = form.get('password');
       if (mode === 'register') {
         data.displayName = form.get('displayName');
-        if (form.get('invite')) data.invite = form.get('invite');
+        if (form.get('invite')) data.invite = rememberInvitation(String(form.get('invite')));
       }
       if (mode === 'recover') data.code = form.get('code');
       if (mode === 'forgot') data.email = form.get('email');
       if (mode === 'reset' || mode === 'verify') data.token = params.get(mode);
-      const result = await api<{ codes?: string[]; message?: string }>(
+      const result = await api<{ codes?: string[]; serverId?: string | null; message?: string }>(
         `auth/${mode}`,
         'POST',
         data,
       );
-      if (mode === 'register' && result.codes) setCodes(result.codes);
-      else if (mode === 'login') {
-        if (!params.has('invite')) history.replaceState(null, '', '/');
+      if (mode === 'register' && result.codes) {
+        setCodes(result.codes);
+        if (result.serverId) sessionStorage.setItem('ripcord-joined', result.serverId);
+        sessionStorage.setItem('ripcord-invite-accepted', '1');
+      } else if (mode === 'login') {
+        if (invite) rememberInvitation(invite);
+        const url = new URL(location.href);
+        url.searchParams.delete('reset');
+        url.searchParams.delete('verify');
+        history.replaceState(null, '', url);
         onLogin();
       } else {
         setNotice(
@@ -57,11 +108,15 @@ export function AuthScreen({ info, onLogin }: { info: PublicInfo; onLogin: () =>
               : 'Password updated. Sign in with your new password.'),
         );
         setMode('login');
-        history.replaceState(null, '', '/');
+        const url = new URL(location.href);
+        url.searchParams.delete('reset');
+        url.searchParams.delete('verify');
+        history.replaceState(null, '', url);
       }
     } catch (e) {
       setError((e as Error).message);
     } finally {
+      submission.current = false;
       setBusy(false);
     }
   }
@@ -124,7 +179,10 @@ export function AuthScreen({ info, onLogin }: { info: PublicInfo; onLogin: () =>
             <button
               className="secondary-button full"
               onClick={() => {
-                history.replaceState(null, '', '/');
+                if (sessionStorage.getItem('ripcord-invite-accepted')) {
+                  clearInvitation();
+                  sessionStorage.removeItem('ripcord-invite-accepted');
+                }
                 onLogin();
               }}
             >
@@ -236,13 +294,38 @@ export function AuthScreen({ info, onLogin }: { info: PublicInfo; onLogin: () =>
                 <input
                   name="invite"
                   required={!info.publicRegistration}
-                  defaultValue={params.get('invite') ?? ''}
+                  value={invite}
+                  onChange={(e) => {
+                    setInvite(e.target.value);
+                    setPreview(null);
+                  }}
                   placeholder="Your invitation code"
                 />
               </label>
             )}
+            {preview && (
+              <p className="success-note">
+                Invitation to {preview.serverName ?? preview.server?.name ?? info.name}
+              </p>
+            )}
+            <ErrorNote error={inviteError} />
+            {invite && (
+              <button
+                type="button"
+                className="text-button"
+                onClick={() => {
+                  clearInvitation();
+                  setInvite('');
+                }}
+              >
+                Cancel invitation
+              </button>
+            )}
             <ErrorNote error={error} />
-            <button className="primary-button full" disabled={busy}>
+            <button
+              className="primary-button full"
+              disabled={busy || (mode === 'register' && !!invite && (!preview || !!inviteError))}
+            >
               {busy
                 ? 'One moment…'
                 : mode === 'login'

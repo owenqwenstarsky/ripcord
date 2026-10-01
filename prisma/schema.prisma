@@ -20,26 +20,31 @@ enum RelationshipKind {
 }
 
 model User {
-  id            String         @id @default(cuid())
-  username      String         @unique
-  displayName   String
-  passwordHash  String
-  avatarId      String?
-  email         String?        @unique
-  emailVerified Boolean        @default(false)
-  friendsOnly   Boolean        @default(false)
-  isAdmin       Boolean        @default(false)
-  suspended     Boolean        @default(false)
-  createdAt     DateTime       @default(now())
-  sessions      Session[]
-  recoveryCodes RecoveryCode[]
-  tokens        AccountToken[]
-  memberships   Membership[]
-  roomMembers   RoomMember[]
-  messages      Message[]
-  reactions     Reaction[]
-  attachments   Attachment[]
-  reads         ReadPosition[]
+  id             String                   @id @default(cuid())
+  username       String                   @unique
+  displayName    String
+  passwordHash   String
+  avatarId       String?
+  email          String?                  @unique
+  emailVerified  Boolean                  @default(false)
+  friendsOnly    Boolean                  @default(false)
+  isAdmin        Boolean                  @default(false)
+  suspended      Boolean                  @default(false)
+  createdAt      DateTime                 @default(now())
+  notifyMentions Boolean                  @default(true)
+  notifyDms      Boolean                  @default(true)
+  mentions       MessageMention[]
+  preferences    NotificationPreference[]
+  sessions       Session[]
+  cancelledSends SendCancellation[]
+  recoveryCodes  RecoveryCode[]
+  tokens         AccountToken[]
+  memberships    Membership[]
+  roomMembers    RoomMember[]
+  messages       Message[]
+  reactions      Reaction[]
+  attachments    Attachment[]
+  reads          ReadPosition[]
 }
 
 model Session {
@@ -141,24 +146,25 @@ model Category {
 }
 
 model Room {
-  id           String               @id @default(cuid())
-  kind         RoomKind             @default(TEXT)
-  serverId     String?
-  categoryId   String?
-  name         String
-  topic        String               @default("")
-  position     Int                  @default(0)
-  synchronized Boolean              @default(true)
-  slowMode     Int                  @default(0)
-  ownerId      String?
-  directKey    String?              @unique
-  createdAt    DateTime             @default(now())
-  server       Server?              @relation(fields: [serverId], references: [id], onDelete: Cascade)
-  category     Category?            @relation(fields: [categoryId], references: [id], onDelete: SetNull)
-  members      RoomMember[]
-  messages     Message[]
-  overrides    PermissionOverride[]
-  reads        ReadPosition[]
+  id             String               @id @default(cuid())
+  kind           RoomKind             @default(TEXT)
+  serverId       String?
+  categoryId     String?
+  name           String
+  topic          String               @default("")
+  position       Int                  @default(0)
+  synchronized   Boolean              @default(true)
+  slowMode       Int                  @default(0)
+  ownerId        String?
+  directKey      String?              @unique
+  createdAt      DateTime             @default(now())
+  server         Server?              @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  category       Category?            @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  members        RoomMember[]
+  messages       Message[]
+  overrides      PermissionOverride[]
+  reads          ReadPosition[]
+  cancelledSends SendCancellation[]
 
   @@index([serverId, position])
 }
@@ -188,8 +194,8 @@ model PermissionOverride {
 }
 
 model Message {
-  id          String       @id @default(cuid())
-  seq         BigInt       @unique @default(autoincrement())
+  id          String           @id @default(cuid())
+  seq         BigInt           @unique @default(autoincrement())
   roomId      String
   authorId    String
   content     String?
@@ -197,13 +203,14 @@ model Message {
   replyId     String?
   editedAt    DateTime?
   deletedAt   DateTime?
-  createdAt   DateTime     @default(now())
-  room        Room         @relation(fields: [roomId], references: [id], onDelete: Cascade)
-  author      User         @relation(fields: [authorId], references: [id])
-  reply       Message?     @relation("Replies", fields: [replyId], references: [id], onDelete: SetNull)
-  replies     Message[]    @relation("Replies")
+  createdAt   DateTime         @default(now())
+  room        Room             @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  author      User             @relation(fields: [authorId], references: [id])
+  reply       Message?         @relation("Replies", fields: [replyId], references: [id], onDelete: SetNull)
+  replies     Message[]        @relation("Replies")
   attachments Attachment[]
   reactions   Reaction[]
+  mentions    MessageMention[]
 
   @@unique([authorId, roomId, nonce])
   @@index([roomId, seq])
@@ -299,6 +306,7 @@ model Report {
 }
 
 model Event {
+  messageId   String?
   id          BigInt    @id @default(autoincrement())
   scope       String
   targetId    String
@@ -307,10 +315,41 @@ model Event {
   deliveredAt DateTime?
 
   @@index([deliveredAt, id])
+  @@index([scope, targetId, id])
 }
 
 model RateBucket {
   key       String   @id
   count     Int      @default(1)
   expiresAt DateTime
+}
+
+model MessageMention {
+  messageId String
+  userId    String
+  message   Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([messageId, userId])
+  @@index([userId, messageId])
+}
+
+model NotificationPreference {
+  userId   String
+  scope    String
+  targetId String
+  muted    Boolean @default(false)
+  user     User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, scope, targetId])
+}
+
+model SendCancellation {
+  authorId String
+  roomId   String
+  nonce    String
+  author   User   @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  room     Room   @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  @@id([authorId, roomId, nonce])
 }

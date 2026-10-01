@@ -56,3 +56,18 @@ The socket handshake uses the same session cookie and requires an allowed origin
 - Server `account.revoked` signals session loss before disconnect.
 
 Clients must reconcile after reconnect and periodically; sockets are notifications, while PostgreSQL history is authoritative. Permission bits are defined in `src/lib/permissions.ts`. There are no public/federated API credentials, bots, or external webhook interfaces in this release.
+
+## Usability additions
+
+- `GET /rooms/:id/messages?around=messageId` returns target context with `messages`, `hasMore`, `hasNewer`, `olderCursor`, and `newerCursor`. Existing `before`/`after` pagination is unchanged.
+- `GET /rooms/:id/send-status/:nonce` returns author-scoped `{ status: sent | not-found | cancelled, message }` without requiring history permission. `DELETE` atomically reconciles or cancels the nonce and returns `sent` or `cancelled`.
+- `POST /uploads/staged` with `{ ids }` returns `{ available }` for the account's uncommitted uploads within their 24-hour lifetime.
+- Room summaries add `readSeq`, `firstUnreadId`, `latestSeq`, `latestEvent`, `lastActivityAt`, and `muted`. Community summaries include `muted`.
+- `GET /mentions?before=seq` returns `{ messages, nextCursor }` in pages of 50.
+- `GET /notifications?afterEvent=id&untilEvent=id` returns `{ messages, nextCursor, hasMore }` in event pages of 100. Events include edits adding mentions. The legacy `after=seq` lookup continues to return an array. Clients must baseline initial/reconnect state and deduplicate message identities.
+- `PATCH /me` accepts `notifyMentions` and `notifyDms`. `PUT /preferences` accepts `{ scope: server | room, targetId, muted }`.
+- Invitation previews and acceptance include `kind`, `serverId`, `serverName`, and community identity; acceptance includes accessible rooms for navigation.
+- Invitation, ban, audit, report, and admin-account lists accept zero-based `page`; existing array responses have up to 100 rows. A full page allows another fetch. Report authorization is applied before pagination.
+- Socket invalidation may include `serverId` as well as `roomId`; clients can invalidate affected community detail separately.
+
+See [conversation and management behavior](USABILITY.md) for persistence, defaults, and user-visible flows.

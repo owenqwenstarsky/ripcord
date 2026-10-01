@@ -1,5 +1,5 @@
 'use client';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   MessageCircle,
@@ -31,7 +31,9 @@ export function Friends({
   const qc = useQueryClient(),
     [tab, setTab] = useState('all'),
     [q, setQ] = useState(''),
-    [notice, setNotice] = useState('');
+    [notice, setNotice] = useState(''),
+    [busy, setBusy] = useState(false);
+  const lock = useRef(false);
   const users = useQuery({
     queryKey: ['users', q],
     queryFn: () => api<Person[]>(`users?q=${encodeURIComponent(q)}`),
@@ -45,12 +47,18 @@ export function Friends({
         : r.kind === 'BLOCK' && r.fromId === workspace.user.id,
   );
   async function act(userId: string, action: string) {
+    if (lock.current) return;
+    lock.current = true;
+    setBusy(true);
     try {
       await api('relationships', 'POST', { userId, action });
       await qc.invalidateQueries({ queryKey: ['workspace'] });
       if (action === 'request') setNotice('Friend request sent.');
     } catch (e) {
       onError((e as Error).message);
+    } finally {
+      lock.current = false;
+      setBusy(false);
     }
   }
   return (
@@ -99,6 +107,8 @@ export function Friends({
             </label>
             {notice && <div className="success-note">{notice}</div>}
             <ErrorNote error={users.error?.message} />
+            {q.length >= 2 && users.isFetching && <p className="muted">Finding people…</p>}
+            {q.length >= 2 && users.data?.length === 0 && <p className="muted">No people found.</p>}
             {users.data?.map((p) => (
               <div className="friend-row" key={p.id}>
                 <Avatar user={p} onClick={() => onProfile(p)} />
@@ -106,8 +116,43 @@ export function Friends({
                   <strong>{p.displayName}</strong>
                   <small>@{p.username}</small>
                 </span>
-                <button className="secondary-button" onClick={() => void act(p.id, 'request')}>
-                  <UserPlus size={16} /> Add friend
+                <button
+                  className="secondary-button"
+                  disabled={
+                    busy ||
+                    workspace.relationships.some(
+                      (r) =>
+                        (r.fromId === p.id || r.toId === p.id) &&
+                        (r.kind === 'FRIEND' ||
+                          r.kind === 'BLOCK' ||
+                          (r.kind === 'REQUEST' && r.fromId === workspace.user.id)),
+                    )
+                  }
+                  onClick={() =>
+                    void act(
+                      p.id,
+                      workspace.relationships.some((r) => r.kind === 'REQUEST' && r.fromId === p.id)
+                        ? 'accept'
+                        : 'request',
+                    )
+                  }
+                >
+                  <UserPlus size={16} />{' '}
+                  {workspace.relationships.some((r) => r.kind === 'BLOCK' && r.toId === p.id)
+                    ? 'Blocked'
+                    : workspace.relationships.some(
+                          (r) => r.kind === 'FRIEND' && (r.fromId === p.id || r.toId === p.id),
+                        )
+                      ? 'Friends'
+                      : workspace.relationships.some(
+                            (r) => r.kind === 'REQUEST' && r.fromId === p.id,
+                          )
+                        ? 'Accept request'
+                        : workspace.relationships.some(
+                              (r) => r.kind === 'REQUEST' && r.toId === p.id,
+                            )
+                          ? 'Request sent'
+                          : 'Add friend'}
                 </button>
               </div>
             ))}

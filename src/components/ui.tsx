@@ -5,18 +5,7 @@ import { X, ChevronDown } from 'lucide-react';
 import type { ReactNode } from 'react';
 import type { Person } from '@/lib/types';
 
-export async function api<T = unknown>(path: string, method = 'GET', data?: unknown): Promise<T> {
-  const response = await fetch(`/api/${path}`, {
-    method,
-    credentials: 'same-origin',
-    headers: data instanceof FormData ? undefined : { 'Content-Type': 'application/json' },
-    body: data === undefined ? undefined : data instanceof FormData ? data : JSON.stringify(data),
-  });
-  const result = await response.json();
-  if (!response.ok)
-    throw Object.assign(new Error(result.error ?? 'Request failed.'), { status: response.status });
-  return result;
-}
+export { api } from '@/lib/client-api';
 export function Logo({ small = false }: { small?: boolean }) {
   return (
     <span className={`brand ${small ? 'brand-small' : ''}`}>
@@ -151,13 +140,22 @@ export function MenuItem({
   children,
   onClick,
   danger = false,
+  disabled = false,
+  reason,
 }: {
   children: ReactNode;
   onClick: () => void;
   danger?: boolean;
+  disabled?: boolean;
+  reason?: string;
 }) {
   return (
-    <Dropdown.Item className={`menu-item ${danger ? 'danger-text' : ''}`} onSelect={onClick}>
+    <Dropdown.Item
+      className={`menu-item ${danger ? 'danger-text' : ''}`}
+      onSelect={onClick}
+      disabled={disabled}
+      title={reason}
+    >
       {children}
     </Dropdown.Item>
   );

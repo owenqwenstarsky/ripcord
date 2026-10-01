@@ -121,7 +121,7 @@ async function main() {
         const user = await validate(socket);
         if (!user) return;
         const access = await roomAccess(user.id, roomId, P.SEND_MESSAGES);
-        if (!access.server)
+        if (access.room.kind === 'DIRECT')
           await dmSendAccess(
             user.id,
             access.room.members.map((m) => m.userId),
@@ -197,6 +197,7 @@ async function main() {
               id: e.id.toString(),
               type: e.type,
               roomId: e.scope === 'room' ? e.targetId : undefined,
+              serverId: e.scope === 'server' ? e.targetId : undefined,
             });
         }
         if (peer.data.roomId && presenceRooms.has(peer.data.roomId)) {
