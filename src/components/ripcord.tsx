@@ -1029,7 +1029,7 @@ function RipCordApp() {
               )}
               {(!atLatest || !!messageTarget) && (
                 <button
-                  className="secondary-button jump-latest"
+                  className="jump-latest"
                   onClick={() => {
                     pinned.current = true;
                     setMessageTarget(null);
@@ -1037,6 +1037,7 @@ function RipCordApp() {
                     scroller.current?.scrollTo?.({ top: scroller.current.scrollHeight });
                   }}
                 >
+                  <ChevronDown size={14} aria-hidden="true" />
                   Jump to latest
                 </button>
               )}
