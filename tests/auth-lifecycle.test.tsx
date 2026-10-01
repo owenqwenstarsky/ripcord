@@ -76,6 +76,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   window.history.replaceState(null, '', '/');
   localStorage.clear();
+  sessionStorage.clear();
   focusManager.setFocused(true);
   onlineManager.setOnline(true);
   listeners.clear();
@@ -203,6 +204,39 @@ describe('authentication lifecycle', () => {
     expect(screen.getByText('Test User')).toBeTruthy();
   });
 
+  it('retains invitation intent through registration and recovery-code acknowledgement', async () => {
+    window.history.replaceState(null, '', '/?invite=community-code');
+    const original = apiMock.getMockImplementation()!;
+    apiMock.mockImplementation(async (path: string, ...args: unknown[]) => {
+      if (path === 'invites/community-code')
+        return {
+          kind: 'community',
+          serverId: 'joined-server',
+          serverName: 'Joined community',
+          server: null,
+        };
+      if (path === 'auth/register') {
+        signedIn = true;
+        return { codes: recoveryCodes, serverId: 'joined-server' };
+      }
+      return original(path, ...args);
+    });
+    await renderApp();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(screen.getByText('Invitation to Joined community')).toBeTruthy();
+    submit(input('DISPLAY NAME'));
+    await flush();
+    expect(sessionStorage.getItem('ripcord-invite')).toBe('community-code');
+    expect(screen.getByText(recoveryCodes[0])).toBeTruthy();
+    await backgroundActivity();
+    expect(sessionStorage.getItem('ripcord-invite')).toBe('community-code');
+    fireEvent.click(screen.getByRole('button', { name: /I’ve saved them/ }));
+    await flush();
+    expect(sessionStorage.getItem('ripcord-invite')).toBeNull();
+    expect(new URLSearchParams(location.search).has('invite')).toBe(false);
+  });
   it('pauses workspace fetching throughout password reset and refreshes after login', async () => {
     window.history.replaceState(null, '', '/?reset=reset-token');
     await renderApp();

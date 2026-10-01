@@ -26,6 +26,7 @@ import {
   requireServerPermission,
   serverAccess,
   roomAccess,
+  accessibleRooms,
   canDm,
   isBlocked,
 } from './access';
@@ -33,6 +34,11 @@ import { P } from './permissions';
 import {
   workspace,
   history,
+  messageContext,
+  sendStatus,
+  cancelSend,
+  mentionHistory,
+  notificationMessages,
   sendMessage,
   modifyMessage,
   react,
@@ -130,6 +136,13 @@ async function dispatch(request: Request): Promise<Response> {
     parts = url.pathname.split('/').filter(Boolean).slice(1);
   const [area, key, action, subkey, subaction] = parts;
   const method = request.method;
+  const page = z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(1000000)
+    .parse(url.searchParams.get('page') ?? 0);
+  const pagination = { skip: page * 100, take: 100 };
   checkOrigin(request);
   if (area === 'health' && method === 'GET') {
     await db.$queryRaw`SELECT 1`;
@@ -160,7 +173,9 @@ async function dispatch(request: Request): Promise<Response> {
       );
       const result = await register(input),
         token = await newSession(result.user.id);
-      return json({ codes: result.codes }, 201, { 'Set-Cookie': sessionCookie(token) });
+      return json({ codes: result.codes, serverId: result.serverId }, 201, {
+        'Set-Cookie': sessionCookie(token),
+      });
     }
     if (key === 'recover' && method === 'POST') {
       const input = await body(request, z.object({ username, code: id, password }));
@@ -215,7 +230,7 @@ async function dispatch(request: Request): Promise<Response> {
   if (area === 'invites' && key && method === 'GET') {
     const invite = await db.invite.findUnique({
       where: { code: key },
-      include: { server: { select: { name: true } } },
+      include: { server: { select: { id: true, name: true, description: true, icon: true } } },
     });
     assert(
       invite &&
@@ -225,7 +240,12 @@ async function dispatch(request: Request): Promise<Response> {
       404,
       'Invitation unavailable.',
     );
-    return json({ serverName: invite.server?.name ?? 'this instance' });
+    return json({
+      kind: invite.serverId ? 'community' : 'instance',
+      server: invite.server,
+      serverId: invite.serverId,
+      serverName: invite.server?.name ?? 'this instance',
+    });
   }
   const user = await requireUser(request);
   await rateLimit(`user:${user.id}`, 300, 60);
@@ -237,6 +257,8 @@ async function dispatch(request: Request): Promise<Response> {
         z.object({
           displayName: name.optional(),
           friendsOnly: z.boolean().optional(),
+          notifyMentions: z.boolean().optional(),
+          notifyDms: z.boolean().optional(),
           avatarId: id.nullable().optional(),
         }),
       );
@@ -383,8 +405,13 @@ async function dispatch(request: Request): Promise<Response> {
     return ok();
   }
   if (area === 'invites' && method === 'POST' && key) {
-    await db.$transaction((tx) => consumeInvite(tx, key, user.id));
-    return ok();
+    const invite = await db.$transaction((tx) => consumeInvite(tx, key, user.id));
+    const joined = await workspace(user.id);
+    return json({
+      kind: invite.serverId ? 'community' : 'instance',
+      serverId: invite.serverId,
+      server: joined.servers.find((s) => s.id === invite.serverId) ?? null,
+    });
   }
   if (area === 'servers') {
     if (!key && method === 'POST') {
@@ -542,7 +569,14 @@ async function dispatch(request: Request): Promise<Response> {
         return json(await createInvite(user.id, key, input.maxUses, input.expiresHours));
       }
       await requireServerPermission(user.id, key, P.MANAGE_SERVER);
-      if (method === 'GET') return json(await db.invite.findMany({ where: { serverId: key } }));
+      if (method === 'GET')
+        return json(
+          await db.invite.findMany({
+            where: { serverId: key },
+            orderBy: { code: 'asc' },
+            ...pagination,
+          }),
+        );
       if (method === 'DELETE' && subkey) {
         await db.invite.updateMany({
           where: { code: subkey, serverId: key },
@@ -554,16 +588,31 @@ async function dispatch(request: Request): Promise<Response> {
     if (action === 'audit' && method === 'GET') {
       await requireServerPermission(user.id, key, P.VIEW_AUDIT_LOG);
       return json(
-        await db.auditLog.findMany({
-          where: { serverId: key },
-          orderBy: { createdAt: 'desc' },
-          take: 100,
-        }),
+        await readableAudit(
+          await db.auditLog.findMany({
+            where: { serverId: key },
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            ...pagination,
+          }),
+        ),
       );
     }
     if (action === 'bans') {
       await requireServerPermission(user.id, key, P.BAN_MEMBERS);
-      if (method === 'GET') return json(await db.ban.findMany({ where: { serverId: key } }));
+      if (method === 'GET') {
+        const bans = await db.ban.findMany({
+          where: { serverId: key },
+          orderBy: { userId: 'asc' },
+          ...pagination,
+        });
+        const people = await db.user.findMany({
+          where: { id: { in: bans.map((b) => b.userId) } },
+          select: personSelect,
+        });
+        return json(
+          bans.map((b) => ({ ...b, user: people.find((p) => p.id === b.userId) ?? null })),
+        );
+      }
       if (method === 'DELETE' && subkey) {
         await serverTransaction(key, async (tx) => {
           await requireServerPermission(user.id, key, P.BAN_MEMBERS, tx);
@@ -581,8 +630,46 @@ async function dispatch(request: Request): Promise<Response> {
     );
     return json(await createDm(user.id, input.userIds, input.name));
   }
+  if (area === 'mentions' && method === 'GET') {
+    const before = url.searchParams.get('before');
+    if (before) numeric.parse(before);
+    return json(await mentionHistory(user.id, before ?? undefined));
+  }
+  if (area === 'notifications' && method === 'GET') {
+    const afterEvent = url.searchParams.get('afterEvent');
+    if (afterEvent) numeric.parse(afterEvent);
+    const untilEvent = url.searchParams.get('untilEvent');
+    if (untilEvent) numeric.parse(untilEvent);
+    const after = numeric.parse(url.searchParams.get('after') ?? '0');
+    return json(
+      await notificationMessages(user.id, after, afterEvent ?? undefined, untilEvent ?? undefined),
+    );
+  }
+  if (area === 'preferences' && method === 'PUT') {
+    const input = await body(
+      request,
+      z.object({ scope: z.enum(['server', 'room']), targetId: id, muted: z.boolean() }),
+    );
+    if (input.scope === 'server') await serverAccess(user.id, input.targetId);
+    else await roomAccess(user.id, input.targetId);
+    const key = { userId: user.id, scope: input.scope, targetId: input.targetId };
+    await db.notificationPreference.upsert({
+      where: { userId_scope_targetId: key },
+      create: { ...key, muted: input.muted },
+      update: { muted: input.muted },
+    });
+    await event(db, 'user', user.id, 'preferences');
+    return ok();
+  }
   if (area === 'rooms' && key) {
+    if (action === 'send-status' && subkey && method === 'GET')
+      return json(await sendStatus(user.id, key, id.parse(subkey)));
+    if (action === 'send-status' && subkey && method === 'DELETE')
+      return json(await cancelSend(user.id, key, id.parse(subkey)));
+
     if (action === 'messages' && method === 'GET') {
+      const target = url.searchParams.get('around');
+      if (target) return json(await messageContext(user.id, key, id.parse(target)));
       const before = url.searchParams.get('before'),
         after = url.searchParams.get('after');
       if (before) numeric.parse(before);
@@ -642,12 +729,18 @@ async function dispatch(request: Request): Promise<Response> {
               await tx.room.update({ where: { id: key }, data: { ownerId: remaining[0].userId } });
           }
         } else {
-          if (input.ownerId)
+          if (input.ownerId) {
+            assert(
+              !(await tx.user.findFirst({ where: { id: input.ownerId, suspended: true } })),
+              400,
+              'A suspended account cannot own a group.',
+            );
             assert(
               room.members.some((m) => m.userId === input.ownerId),
               400,
               'The new owner must be a group member.',
             );
+          }
           await tx.room.update({
             where: { id: key },
             data: { name: input.name, ownerId: input.ownerId },
@@ -685,6 +778,19 @@ async function dispatch(request: Request): Promise<Response> {
     );
   }
   if (area === 'uploads') {
+    if (key === 'staged' && method === 'POST') {
+      const input = await body(request, z.object({ ids: z.array(id).max(20) }));
+      const files = await db.attachment.findMany({
+        where: {
+          id: { in: input.ids },
+          ownerId: user.id,
+          messageId: null,
+          createdAt: { gt: new Date(Date.now() - 86400000) },
+        },
+        select: { id: true },
+      });
+      return json({ available: files.map((f) => f.id) });
+    }
     if (!key && method === 'POST') {
       await rateLimit(`uploads:${user.id}`, 20, 60);
       return json(await upload(request, user.id), 201);
@@ -710,10 +816,28 @@ async function dispatch(request: Request): Promise<Response> {
     if (serverId) await requireServerPermission(user.id, serverId, P.MANAGE_MESSAGES);
     else requireAdmin(user);
     if (method === 'GET') {
+      let reportIds: string[] | undefined;
+      if (serverId) {
+        const access = await serverAccess(user.id, serverId),
+          snapshot = await accessibleRooms(user.id);
+        const roomIds = snapshot.rooms
+          .filter(
+            (r) =>
+              r.serverId === serverId &&
+              (r.permissions & (P.READ_HISTORY | P.MANAGE_MESSAGES)) ===
+                (P.READ_HISTORY | P.MANAGE_MESSAGES),
+          )
+          .map((r) => r.id);
+        const ids = await db.$queryRaw<
+          { id: string }[]
+        >`SELECT r."id" FROM "Report" r LEFT JOIN "Message" m ON m."id" = r."messageId" WHERE r."serverId" = ${serverId} AND (m."roomId" = ANY(${roomIds}::text[]) OR (m."id" IS NULL AND ${(access.permissions & P.MANAGE_SERVER) !== 0n})) ORDER BY r."createdAt" DESC, r."id" DESC OFFSET ${pagination.skip} LIMIT 100`;
+        reportIds = ids.map((r) => r.id);
+      }
       const reports = await db.report.findMany({
-        where: { serverId: serverId ?? null },
-        orderBy: { createdAt: 'desc' },
-        take: 100,
+        where: { serverId: serverId ?? null, ...(reportIds ? { id: { in: reportIds } } : {}) },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        ...pagination,
+        ...(reportIds ? { skip: 0 } : {}),
       });
       const messages = await db.message.findMany({
         where: { id: { in: reports.map((r) => r.messageId) } },
@@ -728,15 +852,6 @@ async function dispatch(request: Request): Promise<Response> {
       const permitted = [];
       for (const report of reports) {
         const message = messages.find((m) => m.id === report.messageId) ?? null;
-        if (serverId) {
-          try {
-            if (message)
-              await roomAccess(user.id, message.roomId, P.READ_HISTORY | P.MANAGE_MESSAGES);
-            else await requireServerPermission(user.id, serverId, P.MANAGE_SERVER);
-          } catch {
-            continue;
-          }
-        }
         permitted.push({ ...report, message });
       }
       return json(permitted);
@@ -788,8 +903,8 @@ async function dispatch(request: Request): Promise<Response> {
       return json(
         await db.user.findMany({
           select: { ...personSelect, suspended: true, isAdmin: true, createdAt: true },
-          take: 200,
-          orderBy: { createdAt: 'desc' },
+          ...pagination,
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         }),
       );
     if (key === 'users' && action && method === 'PATCH') {
@@ -825,7 +940,13 @@ async function dispatch(request: Request): Promise<Response> {
       return json(await createInvite(user.id, null, input.maxUses, input.expiresHours));
     }
     if (key === 'invites' && method === 'GET')
-      return json(await db.invite.findMany({ where: { serverId: null } }));
+      return json(
+        await db.invite.findMany({
+          where: { serverId: null },
+          orderBy: { code: 'asc' },
+          ...pagination,
+        }),
+      );
     if (key === 'invites' && action && method === 'DELETE') {
       await db.invite.updateMany({
         where: { code: action, serverId: null },
@@ -835,11 +956,13 @@ async function dispatch(request: Request): Promise<Response> {
     }
     if (key === 'audit' && method === 'GET')
       return json(
-        await db.auditLog.findMany({
-          where: { serverId: null },
-          orderBy: { createdAt: 'desc' },
-          take: 100,
-        }),
+        await readableAudit(
+          await db.auditLog.findMany({
+            where: { serverId: null },
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            ...pagination,
+          }),
+        ),
       );
     if (key === 'storage' && method === 'GET')
       return json({
@@ -848,4 +971,22 @@ async function dispatch(request: Request): Promise<Response> {
       });
   }
   throw new AppError(404, 'Endpoint not found.');
+}
+
+async function readableAudit(entries: Awaited<ReturnType<typeof db.auditLog.findMany>>) {
+  const ids = entries.flatMap((e) => [e.actorId, ...(e.targetId ? [e.targetId] : [])]);
+  const [people, rooms, roles, categories] = await Promise.all([
+    db.user.findMany({ where: { id: { in: ids } }, select: personSelect }),
+    db.room.findMany({ where: { id: { in: ids } }, select: { id: true, name: true } }),
+    db.role.findMany({ where: { id: { in: ids } }, select: { id: true, name: true } }),
+    db.category.findMany({ where: { id: { in: ids } }, select: { id: true, name: true } }),
+  ]);
+  return entries.map((e) => ({
+    ...e,
+    actor: people.find((p) => p.id === e.actorId) ?? null,
+    targetName:
+      people.find((p) => p.id === e.targetId)?.displayName ??
+      [...rooms, ...roles, ...categories].find((p) => p.id === e.targetId)?.name ??
+      e.targetId,
+  }));
 }

@@ -133,9 +133,9 @@ export async function register(input: {
         passwordHash: pass,
       },
     });
-    if (input.invite) await consumeInvite(tx, input.invite, user.id);
+    const invitation = input.invite ? await consumeInvite(tx, input.invite, user.id) : null;
     const codes = await recoveryCodes(tx, user.id);
-    return { user, codes };
+    return { user, codes, serverId: invitation?.serverId ?? null };
   });
 }
 export async function recover(username: string, code: string, password: string) {

@@ -1,6 +1,7 @@
 'use client';
-import { useState } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { useQuery, useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Plus,
   Trash2,
@@ -14,10 +15,12 @@ import {
   LockKeyhole,
   HardDrive,
 } from 'lucide-react';
+import { clearWork } from '@/lib/draft-storage';
+import { useManagementList, MoreRows } from './chat/use-management-list';
 import type { Workspace, Person } from '@/lib/types';
 import { P, has } from '@/lib/permissions';
 import { api, Avatar, ErrorNote, Modal } from './ui';
-import type { ServerInfo, OverrideData } from './ripcord';
+import type { ServerInfo, OverrideData } from '@/lib/types';
 type Role = ServerInfo['roles'][number];
 const labels: Record<string, string> = {
   VIEW_CHANNEL: 'View channel',
@@ -62,11 +65,25 @@ export function SettingsPanel({
     [tab, setTab] = useState('overview'),
     [error, setError] = useState(''),
     [busy, setBusy] = useState(false);
+  const lock = useRef(false),
+    origin = useRef<HTMLElement | null>(null);
+  const [feedback, setFeedback] = useState<{
+    target: HTMLElement;
+    message: string;
+    failed: boolean;
+  } | null>(null);
   const detail = useQuery({
     queryKey: ['server', serverId],
     queryFn: () => api<ServerInfo>(`servers/${serverId}`),
     enabled: mode === 'server' && !!serverId,
   });
+  useEffect(() => {
+    const guard = (e: BeforeUnloadEvent) => {
+      if (document.querySelector('.settings-layout form[data-dirty="true"]')) e.preventDefault();
+    };
+    window.addEventListener('beforeunload', guard);
+    return () => window.removeEventListener('beforeunload', guard);
+  }, []);
   const allTabs =
     mode === 'account'
       ? [
@@ -112,22 +129,98 @@ export function SettingsPanel({
       : allTabs;
   const activeTab = tabs.some(([id]) => id === tab) ? tab : String(tabs[0]?.[0] ?? 'overview');
   const act: SettingsAction = async (path, method, data, message = 'Changes saved.') => {
+    if (lock.current) return false;
+    lock.current = true;
+    const affected = origin.current;
     setError('');
+    setFeedback(null);
     setBusy(true);
     try {
       await api(path, method, data);
-      await qc.invalidateQueries();
+      if (affected) {
+        affected.removeAttribute('data-dirty');
+        setFeedback({ target: affected, message, failed: false });
+      }
+      const keys =
+        mode === 'account'
+          ? ['workspace']
+          : mode === 'server'
+            ? ['workspace', 'server', 'invites', 'bans', 'reports', 'audit']
+            : [
+                'workspace',
+                'admin-settings',
+                'admin-users',
+                'invites',
+                'reports',
+                'audit',
+                'storage',
+              ];
+      await Promise.all(keys.map((key) => qc.invalidateQueries({ queryKey: [key] })));
       onNotice(message);
       return true;
     } catch (e) {
-      setError((e as Error).message);
+      if (affected) setFeedback({ target: affected, message: (e as Error).message, failed: true });
+      else setError((e as Error).message);
       return false;
     } finally {
+      lock.current = false;
       setBusy(false);
     }
   };
   return (
-    <div className="settings-layout">
+    <div
+      className="settings-layout"
+      onFocusCapture={(e) => {
+        if (e.target instanceof HTMLSelectElement) e.target.dataset.previous = e.target.value;
+      }}
+      onChangeCapture={(e) => {
+        const el = e.target as HTMLElement;
+        const form = el.closest('form');
+        if (form) form.dataset.dirty = 'true';
+        else if (
+          el instanceof HTMLSelectElement &&
+          document.querySelector('.settings-layout form[data-dirty="true"]')
+        ) {
+          if (!window.confirm('Discard unsaved override changes?')) {
+            el.value = el.dataset.previous ?? '';
+            e.stopPropagation();
+          } else el.dataset.previous = el.value;
+        }
+      }}
+      onSubmitCapture={(e) => {
+        if (lock.current) {
+          e.preventDefault();
+          e.stopPropagation();
+        } else origin.current = e.target as HTMLElement;
+      }}
+      onClickCapture={(e) => {
+        const el = e.target as HTMLElement;
+        if (lock.current && el.closest('button')) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        if (
+          el.closest('.settings-nav,.role-picker,.settings-subtabs,.person-result') &&
+          document.querySelector('.settings-layout form[data-dirty="true"]') &&
+          !window.confirm('Discard unsaved settings changes?')
+        ) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        if (el.closest('.settings-nav,.role-picker,.settings-subtabs,.person-result')) {
+          document
+            .querySelectorAll('.settings-layout form[data-dirty="true"]')
+            .forEach((form) => form.removeAttribute('data-dirty'));
+          setFeedback(null);
+        }
+        if (el.closest('button'))
+          origin.current = el.closest(
+            'form,.management-row,.report-row,.audit-row,.invite-management,.member-management',
+          ) as HTMLElement | null;
+      }}
+    >
       <nav className="settings-nav" aria-label="Settings sections">
         {tabs.map(([id, label, Icon]) => {
           const Component = Icon as typeof Settings;
@@ -148,21 +241,37 @@ export function SettingsPanel({
       </nav>
       <div className="settings-content" aria-busy={busy}>
         <ErrorNote error={error} />
-        {mode === 'account' ? (
-          <AccountSettings tab={tab} workspace={workspace} act={act} />
-        ) : mode === 'admin' ? (
-          <AdminSettings tab={tab} act={act} />
-        ) : detail.data ? (
-          <ServerSettings
-            tab={activeTab}
-            server={detail.data}
-            user={workspace.user}
-            act={act}
-            onClose={onClose}
-          />
-        ) : (
-          <p className="muted">{detail.error?.message ?? 'Loading server settings…'}</p>
-        )}
+        <fieldset disabled={busy} className="settings-fieldset">
+          {mode === 'account' ? (
+            <AccountSettings tab={tab} workspace={workspace} act={act} />
+          ) : mode === 'admin' ? (
+            <AdminSettings tab={tab} act={act} />
+          ) : detail.data && !tabs.length ? (
+            <p className="muted">Your permissions no longer allow managing this community.</p>
+          ) : detail.data ? (
+            <ServerSettings
+              tab={activeTab}
+              server={detail.data}
+              user={workspace.user}
+              act={act}
+              onClose={onClose}
+            />
+          ) : (
+            <p className="muted">{detail.error?.message ?? 'Loading server settings…'}</p>
+          )}
+        </fieldset>
+        {feedback &&
+          feedback.target.isConnected &&
+          createPortal(
+            feedback.failed ? (
+              <ErrorNote error={feedback.message} />
+            ) : (
+              <p className="success-note" role="status">
+                {feedback.message}
+              </p>
+            ),
+            feedback.target,
+          )}
       </div>
     </div>
   );
@@ -177,11 +286,13 @@ function AccountSettings({
   act: SettingsAction;
 }) {
   const [codes, setCodes] = useState<string[]>([]),
-    [error, setError] = useState('');
+    [error, setError] = useState(''),
+    [directBusy, setDirectBusy] = useState(false);
+  const directLock = useRef(false);
   const user = workspace.user;
   if (tab === 'overview')
     return (
-      <>
+      <fieldset disabled={directBusy}>
         <h2>Your profile</h2>
         <p className="muted">A familiar face in every conversation.</p>
         <form
@@ -191,6 +302,8 @@ function AccountSettings({
             void act('me', 'PATCH', {
               displayName: f.get('displayName'),
               friendsOnly: f.get('friendsOnly') === 'on',
+              notifyMentions: f.get('notifyMentions') === 'on',
+              notifyDms: f.get('notifyDms') === 'on',
             });
           }}
         >
@@ -203,7 +316,9 @@ function AccountSettings({
                 accept="image/png,image/jpeg,image/webp,image/gif"
                 onChange={async (e) => {
                   const file = e.target.files?.[0];
-                  if (!file) return;
+                  if (!file || directLock.current) return;
+                  directLock.current = true;
+                  setDirectBusy(true);
                   try {
                     const form = new FormData();
                     form.set('file', file);
@@ -211,6 +326,9 @@ function AccountSettings({
                     await act('me', 'PATCH', { avatarId: upload.id });
                   } catch (e) {
                     setError((e as Error).message);
+                  } finally {
+                    directLock.current = false;
+                    setDirectBusy(false);
                   }
                 }}
               />
@@ -240,13 +358,30 @@ function AccountSettings({
               <small>Otherwise, people who share a server can also message you.</small>
             </span>
           </label>
+          <h3>Notifications</h3>
+          <label className="checkbox-line">
+            <input
+              type="checkbox"
+              name="notifyMentions"
+              defaultChecked={user.notifyMentions !== false}
+            />
+            <span>Notify me about exact mentions</span>
+          </label>
+          <label className="checkbox-line">
+            <input type="checkbox" name="notifyDms" defaultChecked={user.notifyDms !== false} />
+            <span>Notify me about incoming direct and group messages</span>
+          </label>
+          <p className="muted">
+            Browser alerts require permission on each device. Muting a community or conversation
+            suppresses alerts and keeps unread counts.
+          </p>
           <ErrorNote error={error} />
           <button className="primary-button">Save profile</button>
         </form>
-      </>
+      </fieldset>
     );
   return (
-    <>
+    <fieldset disabled={directBusy}>
       <h2>Account security</h2>
       <p className="muted">Manage your password, recovery codes, and sessions.</p>
       <h3>Change password</h3>
@@ -289,6 +424,9 @@ function AccountSettings({
         onSubmit={async (e) => {
           e.preventDefault();
           const f = new FormData(e.currentTarget);
+          if (directLock.current) return;
+          directLock.current = true;
+          setDirectBusy(true);
           try {
             const result = await api<{ codes: string[] }>('me/recovery', 'POST', {
               password: f.get('password'),
@@ -297,6 +435,9 @@ function AccountSettings({
             setError('');
           } catch (e) {
             setError((e as Error).message);
+          } finally {
+            directLock.current = false;
+            setDirectBusy(false);
           }
         }}
       >
@@ -368,13 +509,15 @@ function AccountSettings({
       <button
         className="danger-button"
         onClick={async () => {
-          if (await act('me/sessions', 'DELETE', undefined, 'All sessions revoked.'))
+          if (await act('me/sessions', 'DELETE', undefined, 'All sessions revoked.')) {
+            clearWork(user.id);
             window.location.reload();
+          }
         }}
       >
         Sign out everywhere
       </button>
-    </>
+    </fieldset>
   );
 }
 function ServerSettings({
@@ -430,7 +573,14 @@ function ServerSettings({
               onSubmit={(e) => {
                 e.preventDefault();
                 const f = new FormData(e.currentTarget);
-                void act(base, 'PATCH', { ownerId: f.get('ownerId') });
+                const next = server.members.find((m) => m.user.id === f.get('ownerId'));
+                if (
+                  next &&
+                  window.confirm(
+                    `Transfer ownership to ${next.user.displayName}? They will receive full control.`,
+                  )
+                )
+                  void act(base, 'PATCH', { ownerId: next.user.id });
               }}
             >
               <label>
@@ -493,13 +643,39 @@ function ServerSettings({
       </>
     );
   if (tab === 'channels') return <ChannelSettings server={server} act={act} />;
-  if (tab === 'roles') return <RoleSettings server={server} act={act} />;
-  if (tab === 'permissions') return <OverrideSettings server={server} act={act} />;
+  if (tab === 'roles') return <RoleSettings server={server} user={user} act={act} />;
+  if (tab === 'permissions') return <OverrideSettings server={server} user={user} act={act} />;
   if (tab === 'members') return <MemberSettings server={server} user={user} act={act} />;
   if (tab === 'invites') return <Invites base={base} act={act} />;
   if (tab === 'audit') return <Audit path={`${base}/audit`} />;
-  if (tab === 'reports') return <Reports serverId={server.id} act={act} />;
+  if (tab === 'reports')
+    return <Reports serverId={server.id} server={server} user={user} act={act} />;
   return <Bans serverId={server.id} act={act} />;
+}
+function OrderControls({ name, hierarchy = false }: { name: string; hierarchy?: boolean }) {
+  return (
+    <span className="row-actions">
+      {[-1, 1].map((delta) => (
+        <button
+          type="button"
+          className="text-button"
+          key={delta}
+          aria-label={`Move ${name} ${delta < 0 ? 'up' : 'down'}`}
+          onClick={(e) => {
+            const form = e.currentTarget.closest('form')!;
+            const input = form.querySelector<HTMLInputElement>('input[name="position"]')!;
+            input.value = String(
+              Math.max(Number(input.min || 0), Number(input.value) + (hierarchy ? -delta : delta)),
+            );
+            form.dataset.dirty = 'true';
+            input.focus();
+          }}
+        >
+          {delta < 0 ? 'Move up' : 'Move down'}
+        </button>
+      ))}
+    </span>
+  );
 }
 function ChannelSettings({ server, act }: { server: ServerInfo; act: SettingsAction }) {
   const [tab, setTab] = useState('channels'),
@@ -566,6 +742,7 @@ function ChannelSettings({ server, act }: { server: ServerInfo; act: SettingsAct
               <label>
                 ORDER
                 <input type="number" name="position" min={0} defaultValue={c.position} />
+                <OrderControls name={c.name} />
               </label>
               <div className="row-actions">
                 <button className="secondary-button">Save</button>
@@ -596,7 +773,9 @@ function ChannelSettings({ server, act }: { server: ServerInfo; act: SettingsAct
                   categoryId: f.get('categoryId') || null,
                   position: Number(f.get('position')),
                   slowMode: Number(f.get('slowMode')),
-                  synchronized: f.get('synchronized') === 'on',
+                  ...((f.get('categoryId') || null) !== r.categoryId
+                    ? { synchronized: false }
+                    : {}),
                 });
               }}
             >
@@ -637,6 +816,7 @@ function ChannelSettings({ server, act }: { server: ServerInfo; act: SettingsAct
                 <label>
                   ORDER
                   <input type="number" name="position" min={0} defaultValue={r.position ?? 0} />
+                  <OrderControls name={r.name} />
                 </label>
                 <label>
                   SLOW MODE (SECONDS)
@@ -649,13 +829,26 @@ function ChannelSettings({ server, act }: { server: ServerInfo; act: SettingsAct
                   />
                 </label>
               </div>
-              <label className="checkbox-line">
-                <input type="checkbox" name="synchronized" defaultChecked={r.synchronized} />
-                <span>
-                  Synchronize category permissions
-                  <small>Enabling this removes independent channel overrides.</small>
-                </span>
-              </label>
+              <p className="muted">
+                Moving this channel preserves its current permission overrides.{' '}
+                {r.synchronized ? 'Currently synchronized.' : 'Independent channel permissions.'}
+              </p>
+              {r.categoryId && (
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => {
+                    if (
+                      window.confirm(
+                        'Replace channel overrides with the current category permissions?',
+                      )
+                    )
+                      void act(`${base}/channels/${r.id}`, 'PATCH', { synchronized: true });
+                  }}
+                >
+                  Synchronize with current category
+                </button>
+              )}
               <button className="secondary-button">Save channel</button>
             </form>
           ))}
@@ -682,10 +875,20 @@ function ChannelSettings({ server, act }: { server: ServerInfo; act: SettingsAct
     </>
   );
 }
-function RoleSettings({ server, act }: { server: ServerInfo; act: SettingsAction }) {
+function RoleSettings({
+  server,
+  user,
+  act,
+}: {
+  server: ServerInfo;
+  user: Person;
+  act: SettingsAction;
+}) {
   const [selected, setSelected] = useState(server.roles[0]?.id ?? 'new'),
     [confirm, setConfirm] = useState(false);
   const role = server.roles.find((r) => r.id === selected);
+  const editable =
+    server.ownerId === user.id || !role || role.everyone || role.position < server.position;
   return (
     <>
       <h2>Roles & permissions</h2>
@@ -710,21 +913,26 @@ function RoleSettings({ server, act }: { server: ServerInfo; act: SettingsAction
           <Plus size={14} /> New role
         </button>
       </div>
-      <RoleForm
-        key={`${selected}:${role?.permissions}`}
-        role={role}
-        onSave={async (data) => {
-          if (
-            await act(
-              `servers/${server.id}/roles${role ? '/' + role.id : ''}`,
-              role ? 'PATCH' : 'POST',
-              data,
+      {!editable && <p className="muted">You can only manage roles below your highest role.</p>}
+      <fieldset disabled={!editable}>
+        <RoleForm
+          allowed={BigInt(server.permissions)}
+          maxPosition={server.ownerId === user.id ? 10000 : server.position - 1}
+          key={selected}
+          role={role}
+          onSave={async (data) => {
+            if (
+              await act(
+                `servers/${server.id}/roles${role ? '/' + role.id : ''}`,
+                role ? 'PATCH' : 'POST',
+                data,
+              )
             )
-          )
-            if (!role) setSelected(server.roles[0]?.id ?? 'new');
-        }}
-      />
-      {role && !role.everyone && (
+              if (!role) setSelected(server.roles[0]?.id ?? 'new');
+          }}
+        />
+      </fieldset>
+      {editable && role && !role.everyone && (
         <>
           <button className="text-button danger-text" onClick={() => setConfirm(true)}>
             Delete role
@@ -750,17 +958,32 @@ function RoleSettings({ server, act }: { server: ServerInfo; act: SettingsAction
     </>
   );
 }
-function RoleForm({ role, onSave }: { role?: Role; onSave: (data: unknown) => void }) {
+function RoleForm({
+  role,
+  allowed,
+  maxPosition,
+  onSave,
+}: {
+  role?: Role;
+  allowed: bigint;
+  maxPosition: number;
+  onSave: (data: unknown) => void;
+}) {
   const [bits, setBits] = useState(BigInt(role?.permissions ?? '0'));
+  const formRef = useRef<HTMLFormElement>(null);
+  useEffect(() => {
+    if (formRef.current?.dataset.dirty !== 'true') setBits(BigInt(role?.permissions ?? '0'));
+  }, [role?.permissions]);
   return (
     <form
+      ref={formRef}
       onSubmit={(e) => {
         e.preventDefault();
         const f = new FormData(e.currentTarget);
         onSave({
           name: f.get('name'),
           color: f.get('color'),
-          permissions: bits.toString(),
+          ...(bits.toString() !== role?.permissions ? { permissions: bits.toString() } : {}),
           ...(!role?.everyone ? { position: Number(f.get('position')) } : {}),
         });
       }}
@@ -788,9 +1011,10 @@ function RoleForm({ role, onSave }: { role?: Role; onSave: (data: unknown) => vo
             name="position"
             type="number"
             min={1}
-            max={10000}
+            max={maxPosition}
             defaultValue={role?.position ?? 1}
           />
+          <OrderControls hierarchy name={role?.name ?? 'new role'} />
         </label>
       )}
       <div className="permission-list">
@@ -799,6 +1023,10 @@ function RoleForm({ role, onSave }: { role?: Role; onSave: (data: unknown) => vo
             <input
               type="checkbox"
               checked={has(bits, bit)}
+              disabled={!has(allowed, bit)}
+              title={
+                !has(allowed, bit) ? 'You cannot grant permissions you do not have.' : undefined
+              }
               onChange={(e) => setBits((v) => (e.target.checked ? v | bit : v & ~bit))}
             />
             <span>{labels[key]}</span>
@@ -809,7 +1037,15 @@ function RoleForm({ role, onSave }: { role?: Role; onSave: (data: unknown) => vo
     </form>
   );
 }
-function OverrideSettings({ server, act }: { server: ServerInfo; act: SettingsAction }) {
+function OverrideSettings({
+  server,
+  user,
+  act,
+}: {
+  server: ServerInfo;
+  user: Person;
+  act: SettingsAction;
+}) {
   const [scope, setScope] = useState('room'),
     [scopeId, setScopeId] = useState(server.rooms[0]?.id ?? ''),
     [target, setTarget] = useState(`ROLE:${server.roles.find((r) => r.everyone)?.id ?? ''}`);
@@ -821,6 +1057,16 @@ function OverrideSettings({ server, act }: { server: ServerInfo; act: SettingsAc
     room?.synchronized && room.categoryId
       ? (server.categories.find((c) => c.id === room.categoryId)?.overrides ?? [])
       : (selected?.overrides ?? []);
+  const roleTarget = server.roles.find((r) => r.id === targetId),
+    memberTarget = server.members.find((m) => m.user.id === targetId);
+  const editable =
+    server.ownerId === user.id ||
+    (targetType === 'ROLE'
+      ? !!roleTarget && (roleTarget.everyone || roleTarget.position < server.position)
+      : targetId === user.id ||
+        (!!memberTarget &&
+          targetId !== server.ownerId &&
+          Math.max(0, ...memberTarget.roles.map((r) => r.role.position)) < server.position));
   const existing = effective.find((o) => o.targetType === targetType && o.targetId === targetId);
   return (
     <>
@@ -880,48 +1126,62 @@ function OverrideSettings({ server, act }: { server: ServerInfo; act: SettingsAc
       {room?.synchronized && (
         <p className="success-note">Currently synchronized with category permissions.</p>
       )}
+      {!editable && <p className="muted">Role hierarchy prevents managing this target.</p>}
       {scopeId && (
-        <OverrideForm
-          key={`${scope}:${scopeId}:${target}:${existing?.allow}:${existing?.deny}`}
-          existing={existing}
-          onSave={(allow, deny) =>
-            void act(`servers/${server.id}/overrides`, 'PUT', {
-              scope,
-              id: scopeId,
-              targetType,
-              targetId,
-              allow,
-              deny,
-            })
-          }
-          onReset={() =>
-            void act(`servers/${server.id}/overrides`, 'DELETE', {
-              scope,
-              id: scopeId,
-              targetType,
-              targetId,
-              allow: '0',
-              deny: '0',
-            })
-          }
-        />
+        <fieldset disabled={!editable}>
+          <OverrideForm
+            allowed={BigInt(server.permissions)}
+            key={`${scope}:${scopeId}:${target}`}
+            existing={existing}
+            onSave={(allow, deny) =>
+              void act(`servers/${server.id}/overrides`, 'PUT', {
+                scope,
+                id: scopeId,
+                targetType,
+                targetId,
+                allow,
+                deny,
+              })
+            }
+            onReset={() =>
+              void act(`servers/${server.id}/overrides`, 'DELETE', {
+                scope,
+                id: scopeId,
+                targetType,
+                targetId,
+                allow: '0',
+                deny: '0',
+              })
+            }
+          />
+        </fieldset>
       )}
     </>
   );
 }
 function OverrideForm({
   existing,
+  allowed,
   onSave,
   onReset,
 }: {
   existing?: OverrideData;
+  allowed: bigint;
   onSave: (allow: string, deny: string) => void;
   onReset: () => void;
 }) {
   const [allow, setAllow] = useState(BigInt(existing?.allow ?? 0)),
     [deny, setDeny] = useState(BigInt(existing?.deny ?? 0));
+  const formRef = useRef<HTMLFormElement>(null);
+  useEffect(() => {
+    if (formRef.current?.dataset.dirty !== 'true') {
+      setAllow(BigInt(existing?.allow ?? 0));
+      setDeny(BigInt(existing?.deny ?? 0));
+    }
+  }, [existing?.allow, existing?.deny]);
   return (
     <form
+      ref={formRef}
       onSubmit={(e) => {
         e.preventDefault();
         onSave(allow.toString(), deny.toString());
@@ -934,6 +1194,12 @@ function OverrideForm({
             <label key={key}>
               <span>{labels[key]}</span>
               <select
+                disabled={!has(allowed, bit)}
+                title={
+                  !has(allowed, bit)
+                    ? 'You cannot override permissions you do not have.'
+                    : undefined
+                }
                 value={has(allow, bit) ? 'allow' : has(deny, bit) ? 'deny' : 'inherit'}
                 onChange={(e) => {
                   setAllow((v) => (e.target.value === 'allow' ? v | bit : v & ~bit));
@@ -967,6 +1233,19 @@ function MemberSettings({
 }) {
   const [selected, setSelected] = useState('');
   const member = server.members.find((m) => m.user.id === selected);
+  const bits = BigInt(server.permissions),
+    owner = server.ownerId === user.id;
+  const targetable =
+    !!member &&
+    (owner ||
+      (member.user.id !== user.id &&
+        member.user.id !== server.ownerId &&
+        Math.max(0, ...member.roles.map((r) => r.role.position)) < server.position));
+  const moderation = [
+    ['timeout', P.MODERATE_MEMBERS],
+    ['kick', P.KICK_MEMBERS],
+    ['ban', P.BAN_MEMBERS],
+  ] as const;
   return (
     <>
       <h2>Members</h2>
@@ -991,53 +1270,76 @@ function MemberSettings({
       {member && (
         <div className="member-management" key={member.id}>
           <h3>{member.user.displayName}</h3>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              const f = new FormData(e.currentTarget);
-              void act(`servers/${server.id}/members/${member.user.id}/roles`, 'PUT', {
-                roleIds: f.getAll('roles'),
-              });
-            }}
-          >
-            <div className="permission-list">
-              {server.roles
-                .filter((r) => !r.everyone)
-                .map((r) => (
-                  <label className="checkbox-line" key={r.id}>
-                    <input
-                      type="checkbox"
-                      name="roles"
-                      value={r.id}
-                      defaultChecked={member.roles.some((m) => m.role.id === r.id)}
-                    />
-                    <span style={{ color: r.color }}>{r.name}</span>
-                  </label>
-                ))}
-            </div>
-            <button className="primary-button">Save member roles</button>
-          </form>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              const f = new FormData(e.currentTarget);
-              void act(`servers/${server.id}/members/${member.user.id}`, 'POST', {
-                action: 'nickname',
-                nickname: f.get('nickname') || null,
-              });
-            }}
-          >
-            <label>
-              SERVER NICKNAME
-              <input name="nickname" defaultValue={member.nickname ?? ''} maxLength={32} />
-            </label>
-            <button className="secondary-button">Save nickname</button>
-          </form>
-          {member.user.id !== user.id && member.user.id !== server.ownerId && (
+          {!targetable && (
+            <p className="muted">
+              Role hierarchy prevents changing this member’s roles or moderating them.
+            </p>
+          )}
+          <fieldset disabled={!targetable || !has(bits, P.MANAGE_ROLES)}>
             <form
               onSubmit={(e) => {
                 e.preventDefault();
                 const f = new FormData(e.currentTarget);
+                void act(`servers/${server.id}/members/${member.user.id}/roles`, 'PUT', {
+                  roleIds: f.getAll('roles'),
+                });
+              }}
+            >
+              <div className="permission-list">
+                {server.roles
+                  .filter((r) => !r.everyone)
+                  .map((r) => (
+                    <label className="checkbox-line" key={r.id}>
+                      <input
+                        type="checkbox"
+                        name="roles"
+                        value={r.id}
+                        defaultChecked={member.roles.some((m) => m.role.id === r.id)}
+                        disabled={!owner && r.position >= server.position}
+                      />
+                      {!owner &&
+                        r.position >= server.position &&
+                        member.roles.some((m) => m.role.id === r.id) && (
+                          <input type="hidden" name="roles" value={r.id} />
+                        )}
+                      <span style={{ color: r.color }}>{r.name}</span>
+                    </label>
+                  ))}
+              </div>
+              <button className="primary-button">Save member roles</button>
+            </form>
+          </fieldset>
+          <fieldset
+            disabled={
+              member.user.id === user.id
+                ? !has(bits, P.CHANGE_NICKNAME)
+                : !targetable || !has(bits, P.MANAGE_NICKNAMES)
+            }
+          >
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const f = new FormData(e.currentTarget);
+                void act(`servers/${server.id}/members/${member.user.id}`, 'POST', {
+                  action: 'nickname',
+                  nickname: f.get('nickname') || null,
+                });
+              }}
+            >
+              <label>
+                SERVER NICKNAME
+                <input name="nickname" defaultValue={member.nickname ?? ''} maxLength={32} />
+              </label>
+              <button className="secondary-button">Save nickname</button>
+            </form>
+          </fieldset>
+          {targetable && moderation.some(([, bit]) => has(bits, bit)) && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const f = new FormData(e.currentTarget);
+                if (!window.confirm(`Apply ${f.get('action')} to ${member.user.displayName}?`))
+                  return;
                 void act(`servers/${server.id}/members/${member.user.id}`, 'POST', {
                   action: f.get('action'),
                   seconds: Number(f.get('seconds')),
@@ -1055,9 +1357,17 @@ function MemberSettings({
                 <label>
                   ACTION
                   <select name="action">
-                    <option value="timeout">Timeout / remove timeout</option>
-                    <option value="kick">Kick</option>
-                    <option value="ban">Ban</option>
+                    {moderation
+                      .filter(([, bit]) => has(bits, bit))
+                      .map(([action]) => (
+                        <option key={action} value={action}>
+                          {action === 'timeout'
+                            ? 'Timeout / remove timeout'
+                            : action === 'kick'
+                              ? 'Kick'
+                              : 'Ban'}
+                        </option>
+                      ))}
                   </select>
                 </label>
                 <label>
@@ -1083,19 +1393,13 @@ function MemberSettings({
   );
 }
 function Invites({ base, act }: { base: string; act: SettingsAction }) {
-  const invites = useQuery({
-    queryKey: ['invites', base],
-    queryFn: () =>
-      api<
-        {
-          code: string;
-          uses: number;
-          maxUses: number | null;
-          expiresAt: string | null;
-          revoked: boolean;
-        }[]
-      >(`${base}/invites`),
-  });
+  const invites = useManagementList<{
+    code: string;
+    uses: number;
+    maxUses: number | null;
+    expiresAt: string | null;
+    revoked: boolean;
+  }>(['invites', base], `${base}/invites`);
   return (
     <>
       <h2>Invitations</h2>
@@ -1159,7 +1463,14 @@ function Invites({ base, act }: { base: string; act: SettingsAction }) {
             {!i.revoked && (
               <button
                 className="text-button danger-text"
-                onClick={() => void act(`${base}/invites/${i.code}`, 'DELETE')}
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      'Revoke this invitation? People with this link will no longer be able to join.',
+                    )
+                  )
+                    void act(`${base}/invites/${i.code}`, 'DELETE');
+                }}
               >
                 Revoke
               </button>
@@ -1167,24 +1478,21 @@ function Invites({ base, act }: { base: string; act: SettingsAction }) {
           </div>
         </div>
       ))}
+      <MoreRows query={invites} />
     </>
   );
 }
 function Audit({ path }: { path: string }) {
-  const query = useQuery({
-    queryKey: ['audit', path],
-    queryFn: () =>
-      api<
-        {
-          id: string;
-          action: string;
-          actorId: string;
-          targetId: string | null;
-          createdAt: string;
-          detail: Record<string, unknown>;
-        }[]
-      >(path),
-  });
+  const query = useManagementList<{
+    id: string;
+    action: string;
+    actorId: string;
+    actor: Person | null;
+    targetId: string | null;
+    targetName: string | null;
+    createdAt: string;
+    detail: Record<string, unknown>;
+  }>(['audit', path], path);
   return (
     <>
       <h2>Audit log</h2>
@@ -1196,32 +1504,43 @@ function Audit({ path }: { path: string }) {
           <span>
             <strong>{a.action.replaceAll('.', ' → ')}</strong>
             <small>
-              {new Date(a.createdAt).toLocaleString()} · Actor {a.actorId}
+              {new Date(a.createdAt).toLocaleString()} · Actor {a.actor?.displayName ?? a.actorId}
             </small>
-            {a.targetId && <small>Target {a.targetId}</small>}
+            {a.targetId && <small>Target {a.targetName ?? a.targetId}</small>}
             {typeof a.detail.reason === 'string' && a.detail.reason && <p>{a.detail.reason}</p>}
           </span>
         </div>
       ))}
+      <MoreRows query={query} />
       {query.data?.length === 0 && <p className="muted">No actions recorded.</p>}
     </>
   );
 }
-function Reports({ serverId, act }: { serverId?: string; act: SettingsAction }) {
+function Reports({
+  serverId,
+  server,
+  user,
+  act,
+}: {
+  serverId?: string;
+  server?: ServerInfo;
+  user?: Person;
+  act: SettingsAction;
+}) {
   const suffix = serverId ? `?serverId=${serverId}` : '';
-  const query = useQuery({
-    queryKey: ['reports', serverId],
-    queryFn: () =>
-      api<
-        {
-          id: string;
-          reason: string;
-          resolvedAt: string | null;
-          message: { content: string | null; author: Person; deletedAt: string | null } | null;
-          createdAt: string;
-        }[]
-      >(`reports${suffix}`),
-  });
+  const query = useManagementList<{
+    id: string;
+    reason: string;
+    resolvedAt: string | null;
+    message: {
+      id: string;
+      roomId: string;
+      content: string | null;
+      author: Person;
+      deletedAt: string | null;
+    } | null;
+    createdAt: string;
+  }>(['reports', serverId], `reports${suffix}`);
   return (
     <>
       <h2>{serverId ? 'Community reports' : 'Reported direct messages'}</h2>
@@ -1244,6 +1563,59 @@ function Reports({ serverId, act }: { serverId?: string; act: SettingsAction }) 
           ) : (
             <p className="muted">Message deleted or unavailable.</p>
           )}
+          {serverId && r.message && (
+            <div className="row-actions">
+              <a
+                className="text-button"
+                href={`/?room=${encodeURIComponent(r.message.roomId)}&message=${encodeURIComponent(r.message.id)}`}
+              >
+                Open reported message
+              </a>
+              {!r.message.deletedAt && (
+                <button
+                  className="text-button danger-text"
+                  onClick={() => {
+                    if (window.confirm('Delete the reported message?'))
+                      void act(`messages/${r.message!.id}`, 'DELETE');
+                  }}
+                >
+                  Delete reported message
+                </button>
+              )}
+              {server &&
+                user &&
+                r.message.author.id !== user.id &&
+                r.message.author.id !== server.ownerId &&
+                (server.ownerId === user.id ||
+                  Math.max(
+                    0,
+                    ...(server.members
+                      .find((m) => m.user.id === r.message!.author.id)
+                      ?.roles.map((x) => x.role.position) ?? []),
+                  ) < server.position) &&
+                [
+                  ['timeout', P.MODERATE_MEMBERS],
+                  ['ban', P.BAN_MEMBERS],
+                ]
+                  .filter(([, bit]) => has(BigInt(server.permissions), bit as bigint))
+                  .map(([action]) => (
+                    <button
+                      key={String(action)}
+                      className="text-button danger-text"
+                      onClick={() => {
+                        if (window.confirm(`Apply ${action} to ${r.message!.author.displayName}?`))
+                          void act(`servers/${serverId}/members/${r.message!.author.id}`, 'POST', {
+                            action,
+                            reason: r.reason.slice(0, 500),
+                            ...(action === 'timeout' ? { seconds: 3600 } : {}),
+                          });
+                      }}
+                    >
+                      {action === 'timeout' ? 'Timeout for 1 hour' : 'Ban author'}
+                    </button>
+                  ))}
+            </div>
+          )}
           {!r.resolvedAt && (
             <button
               className="secondary-button"
@@ -1254,15 +1626,16 @@ function Reports({ serverId, act }: { serverId?: string; act: SettingsAction }) 
           )}
         </div>
       ))}
+      <MoreRows query={query} />
       {query.data?.length === 0 && <p className="muted">No reports.</p>}
     </>
   );
 }
 function Bans({ serverId, act }: { serverId: string; act: SettingsAction }) {
-  const q = useQuery({
-    queryKey: ['bans', serverId],
-    queryFn: () => api<{ userId: string; reason: string }[]>(`servers/${serverId}/bans`),
-  });
+  const q = useManagementList<{ userId: string; user: Person | null; reason: string }>(
+    ['bans', serverId],
+    `servers/${serverId}/bans`,
+  );
   return (
     <>
       <h2>Server bans</h2>
@@ -1270,17 +1643,26 @@ function Bans({ serverId, act }: { serverId: string; act: SettingsAction }) {
       {q.data?.map((b) => (
         <div className="management-row" key={b.userId}>
           <span>
-            <strong>{b.userId}</strong>
+            <strong>{b.user?.displayName ?? b.userId}</strong>
+            {b.user && <small>@{b.user.username}</small>}
             <small>{b.reason || 'No reason provided'}</small>
           </span>
           <button
             className="secondary-button"
-            onClick={() => void act(`servers/${serverId}/bans/${b.userId}`, 'DELETE')}
+            onClick={() => {
+              if (
+                window.confirm(
+                  `Revoke the ban for ${b.user?.displayName ?? b.userId}? They will be able to join again.`,
+                )
+              )
+                void act(`servers/${serverId}/bans/${b.userId}`, 'DELETE');
+            }}
           >
             Revoke ban
           </button>
         </div>
       ))}
+      <MoreRows query={q} />
       {q.data?.length === 0 && <p className="muted">No banned members.</p>}
     </>
   );
@@ -1298,11 +1680,11 @@ function AdminSettings({ tab, act }: { tab: string; act: SettingsAction }) {
     queryKey: ['admin-settings'],
     queryFn: () => api<InstanceSettings>('admin/settings'),
   });
-  const users = useQuery({
-    queryKey: ['admin-users'],
-    queryFn: () => api<(Person & { suspended: boolean; isAdmin: boolean })[]>('admin/users'),
-    enabled: tab === 'users',
-  });
+  const users = useManagementList<Person & { suspended: boolean; isAdmin: boolean }>(
+    ['admin-users'],
+    'admin/users',
+    tab === 'users',
+  );
   const storage = useQuery({
     queryKey: ['storage'],
     queryFn: () =>
@@ -1353,15 +1735,23 @@ function AdminSettings({ tab, act }: { tab: string; act: SettingsAction }) {
             {!u.isAdmin && (
               <button
                 className={u.suspended ? 'secondary-button' : 'danger-button'}
-                onClick={() =>
-                  void act(`admin/users/${u.id}`, 'PATCH', { suspended: !u.suspended })
-                }
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      u.suspended
+                        ? `Restore ${u.displayName}'s account?`
+                        : `Suspend ${u.displayName}'s account and revoke all their sessions?`,
+                    )
+                  )
+                    void act(`admin/users/${u.id}`, 'PATCH', { suspended: !u.suspended });
+                }}
               >
                 {u.suspended ? 'Restore' : 'Suspend'}
               </button>
             )}
           </div>
         ))}
+        <MoreRows query={users} />
       </>
     );
   if (!q.data) return <p className="muted">{q.error?.message ?? 'Loading settings…'}</p>;

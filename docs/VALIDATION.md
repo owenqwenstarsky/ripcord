@@ -15,6 +15,20 @@ Checked October 1, 2026 on this workspace with Node 22.22.3, local PostgreSQL 17
 - Backup of PostgreSQL and the upload volume, followed by deletion/restoration of the isolated verification stack's data, recovered the message and its attachment.
 - Shared-browser desktop checks: sign-in, sending, message persistence, full-text search, account settings, role permission controls, category/channel override controls, dialog focus, and light/dark switching passed. A desktop screenshot was captured and inspected.
 
-Phone layouts are implemented with responsive CSS, but phone-sized browser verification could not be completed because the shared preview's resize operation repeatedly timed out. SMTP token behavior is covered by integration tests; delivery through a real configured SMTP service was not exercised.
+The initial phone-layout audit could not complete browser verification because preview resizing timed out; the subsequent usability pass verified phone breakpoints in dedicated tabs (details below). SMTP token behavior is covered by integration tests; delivery through a real configured SMTP service was not exercised.
 
 Reproduce server checks with `npm run typecheck`, `npm test`, `npm run test:integration`, `npm run test:load`, `npm run build`, and `npm audit`. See the README for Docker installation and backup/restore commands. The load test requires a running local instance matching the shell's database URL and APP_URL and cleans up its own fixtures.
+
+## Functionality and usability pass
+
+Validated October 1, 2026 after the usability changes:
+
+- TypeScript, production build, formatting, and diff whitespace checks passed.
+- 73 unit/component tests and 33 isolated PostgreSQL integration tests passed.
+- Dependency audit reported zero vulnerabilities.
+- 100 authenticated sockets subscribed and received committed events. Duplicate sends committed once; delivery p50 was 292 ms and p95 was 294 ms in this run. Live access/session revocation and reconnect recovery passed.
+- Workspace SQL query growth remained bounded when adding 20 channels; the regression asserts fewer than 35 queries and no per-room growth.
+- Shared-browser onboarding, conversation, catch-up, group-management, settings, and moderation journeys passed. Phone controls were verified at measured 427- and 513-pixel widths with no horizontal overflow.
+- Earlier history preserved the visible message at exactly the same position. Historical deep links retained newer unread messages and their previous read position.
+
+See [USABILITY.md](USABILITY.md) for detailed behavior and verification limits. Native notification delivery was not exercised over the HTTP fixture; mocked browser tests cover preference, mute, block, deduplication, burst pagination, failure retry, and reconnect behavior.

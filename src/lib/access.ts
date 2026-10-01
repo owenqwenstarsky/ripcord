@@ -193,3 +193,71 @@ export async function roomAudience(roomId: string, userIds: string[]) {
   }
   return { allowed, members };
 }
+
+// One authorization snapshot for workspace/search/list endpoints. Database failures propagate.
+export async function accessibleRooms(userId: string) {
+  const memberships = await db.membership.findMany({
+    where: { userId },
+    include: {
+      roles: { include: { role: true } },
+      server: { include: { roles: true, categories: true } },
+    },
+  });
+  const rooms = await db.room.findMany({
+    where: {
+      OR: [
+        { serverId: { in: memberships.map((m) => m.serverId) } },
+        { members: { some: { userId } } },
+      ],
+    },
+    include: {
+      overrides: true,
+      category: { include: { overrides: true } },
+      members: {
+        include: {
+          user: { select: { id: true, username: true, displayName: true, avatarId: true } },
+        },
+      },
+    },
+    orderBy: [{ position: 'asc' }, { id: 'asc' }],
+  });
+  const servers = memberships.map((m) => {
+    const everyone = m.server.roles.find((r) => r.everyone)!;
+    const base = m.roles.reduce((bits, r) => bits | r.role.permissions, everyone.permissions);
+    return {
+      member: m,
+      everyone,
+      base,
+      owner: m.server.ownerId === userId,
+      permissions: m.server.ownerId === userId || has(base, P.ADMINISTRATOR) ? ALL : base,
+    };
+  });
+  const visible = rooms.flatMap((room) => {
+    const access = servers.find((s) => s.member.serverId === room.serverId);
+    let permissions =
+      room.kind !== 'TEXT'
+        ? ALL
+        : access
+          ? resolvePermissions({
+              owner: access.owner,
+              userId,
+              everyoneId: access.everyone.id,
+              base: access.base,
+              roleIds: access.member.roles.map((r) => r.roleId),
+              overrides:
+                room.synchronized && room.category ? room.category.overrides : room.overrides,
+            })
+          : 0n;
+    if (
+      access?.member.timeoutUntil &&
+      access.member.timeoutUntil > new Date() &&
+      !access.owner &&
+      !has(access.base, P.ADMINISTRATOR)
+    )
+      permissions &= ~(P.SEND_MESSAGES | P.ADD_REACTIONS | P.ATTACH_FILES | P.MENTION_EVERYONE);
+    if (!has(permissions, P.VIEW_CHANNEL)) return [];
+    const { overrides: _overrides, category: _category, ...data } = room;
+    return [{ ...data, permissions }];
+  });
+  return { servers, rooms: visible };
+}

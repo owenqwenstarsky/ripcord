@@ -43,8 +43,16 @@ import {
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { P, has } from '@/lib/permissions';
+import { useNavigation, messageLink } from './chat/use-navigation';
+import { useConversationState } from './chat/use-conversation-state';
+import { QuickSwitcher, CatchUp } from './chat/navigation-dialogs';
+import { useNotifications } from './chat/use-notifications';
+import { InvitationForm } from './chat/invitation-form';
+import { pendingInvitation, rememberInvitation } from '@/lib/invitations';
+import { useTimeline } from './chat/use-timeline';
+import { clearWork, type Pending } from '@/lib/draft-storage';
 import { createMessageNonce } from '@/lib/message-nonce';
-import type { ChatMessage, ChatRoom, Community, Person, Workspace } from '@/lib/types';
+import type { ChatMessage, ChatRoom, Community, Person, Workspace, ServerInfo } from '@/lib/types';
 import { AuthScreen } from './auth-screen';
 import { api, Logo, Avatar, Modal, Menu, MenuItem, ErrorNote, Empty } from './ui';
 import { SettingsPanel } from './settings-panel';
@@ -75,27 +83,32 @@ type PublicInfo = {
   needsBootstrap: boolean;
   smtp: boolean;
 };
-type Pending = {
-  nonce: string;
-  roomId: string;
-  content: string;
-  attachmentIds: string[];
-  replyId?: string;
-  failed: boolean;
-  error?: string;
-};
 function RipCordApp() {
   const qc = useQueryClient();
+  const cachedAccount = useRef<string | null>(null);
   const [accountReset, setAccountReset] = useState<boolean | null>(null);
   const publicInfo = useQuery({ queryKey: ['public'], queryFn: () => api<PublicInfo>('public') });
   const data = useQuery({
     queryKey: ['workspace'],
     queryFn: async (): Promise<Workspace | null> => {
       try {
-        return await api<Workspace>('workspace');
+        const result = await api<Workspace>('workspace');
+        if (cachedAccount.current !== result.user.id) {
+          qc.removeQueries({
+            predicate: (query) => !['public', 'workspace'].includes(String(query.queryKey[0])),
+          });
+          cachedAccount.current = result.user.id;
+        }
+        return result;
       } catch (error) {
         // Signed out is a stable result, so refetching cannot reset the authentication form.
-        if ((error as Error & { status?: number }).status === 401) return null;
+        if ((error as Error & { status?: number }).status === 401) {
+          qc.removeQueries({
+            predicate: (query) => !['public', 'workspace'].includes(String(query.queryKey[0])),
+          });
+          cachedAccount.current = null;
+          return null;
+        }
         throw error;
       }
     },
@@ -105,9 +118,6 @@ function RipCordApp() {
     refetchOnReconnect: (query) => !!query.state.data,
     retry: false,
   });
-  const [serverId, setServerId] = useState<string | null>(null),
-    [roomId, setRoomId] = useState<string | null>(null),
-    [initialized, setInitialized] = useState(false);
   const [modal, setModal] = useState(''),
     [error, setError] = useState(''),
     [notice, setNotice] = useState('');
@@ -118,23 +128,46 @@ function RipCordApp() {
     [connected, setConnected] = useState(false),
     [online, setOnline] = useState<Person[]>([]),
     [typing, setTyping] = useState<Record<string, { name: string; until: number }>>({});
-  const [content, setContent] = useState(''),
-    [reply, setReply] = useState<ChatMessage | null>(null),
-    [files, setFiles] = useState<{ id: string; name: string }[]>([]),
-    [uploading, setUploading] = useState(false),
-    [pending, setPending] = useState<Pending[]>([]);
   const [search, setSearch] = useState(''),
     [searchQuery, setSearchQuery] = useState(''),
     [collapsed, setCollapsed] = useState<string[]>([]);
   const socket = useRef<Socket | null>(null),
-    currentRoom = useRef(roomId),
-    scroller = useRef<HTMLDivElement>(null),
+    currentRoom = useRef<string | null>(null),
     inputRef = useRef<HTMLTextAreaElement>(null),
-    pinned = useRef(true),
     fileInput = useRef<HTMLInputElement>(null);
-  currentRoom.current = roomId;
   const workspace = data.data,
     user = workspace?.user;
+  const {
+    serverId,
+    setServerId,
+    roomId,
+    setRoomId,
+    messageTarget,
+    readTarget,
+    setMessageTarget,
+    choose,
+    lastChannel,
+  } = useNavigation(workspace);
+  currentRoom.current = roomId;
+  const {
+    content,
+    setContent,
+    reply,
+    setReply,
+    files,
+    setFiles,
+    uploading,
+    pending,
+    setPending,
+    transmit,
+    reconcile,
+    uploadFiles: stageFiles,
+  } = useConversationState(user?.id, roomId, setError, (message) => {
+    if (!user || message.authorId !== user.id) return;
+    notify('Message sent.');
+    void qc.invalidateQueries({ queryKey: ['messages', message.roomId] });
+    void qc.invalidateQueries({ queryKey: ['workspace'] });
+  });
   const server = workspace?.servers.find((s) => s.id === serverId);
   const allRooms = [
     ...(workspace?.servers.flatMap((s) => s.rooms) ?? []),
@@ -147,22 +180,19 @@ function RipCordApp() {
     queryFn: () => api<ServerInfo>(`servers/${serverId}`),
     enabled: !!serverId,
   });
-  const history = useInfiniteQuery({
-    queryKey: ['messages', roomId],
-    queryFn: ({ pageParam }) =>
-      api<{ messages: ChatMessage[]; hasMore: boolean }>(
-        `rooms/${roomId}/messages${pageParam ? `?before=${pageParam}` : ''}`,
-      ),
-    initialPageParam: '',
-    getNextPageParam: (last) => (last.hasMore ? last.messages[0]?.seq : undefined),
-    enabled: !!roomId && !!room && has(BigInt(room.permissions), P.READ_HISTORY),
-    refetchInterval: 20000,
-  });
-  const messageMap = new Map<string, ChatMessage>();
-  if (room && has(BigInt(room.permissions), P.READ_HISTORY) && !history.isError)
-    for (const page of [...(history.data?.pages ?? [])].reverse())
-      for (const m of page.messages) messageMap.set(m.id, m);
-  const messages = [...messageMap.values()];
+  const {
+    history,
+    messages,
+    scroller,
+    pinned,
+    atLatest,
+    hasNewer,
+    loadingNewer,
+    loadEarlier,
+    loadNewer,
+    onScroll,
+    enableReads,
+  } = useTimeline(room, messageTarget, setError, readTarget, user?.id);
   const results = useQuery({
     queryKey: ['search', searchQuery, serverId, roomId],
     queryFn: () =>
@@ -171,6 +201,13 @@ function RipCordApp() {
       ),
     enabled: !!searchQuery && modal === 'search',
   });
+  useNotifications(workspace, connected, roomId, chooseRoom, data.dataUpdatedAt);
+  useEffect(() => {
+    setModal('');
+    setSelectedUser(null);
+    setError('');
+    setNotice('');
+  }, [user?.id]);
   const related = workspace?.relationships ?? [];
   const blocked = new Set(
     related.filter((r) => r.kind === 'BLOCK' && r.fromId === user?.id).map((r) => r.toId),
@@ -185,26 +222,30 @@ function RipCordApp() {
   }, [notice]);
   useEffect(() => {
     setAccountReset(new URLSearchParams(window.location.search).has('reset'));
+    if (window.matchMedia?.('(max-width: 900px)').matches) setShowMembers(false);
     const value = localStorage.getItem('ripcord-theme') ?? 'dark';
     setTheme(value);
     document.documentElement.dataset.theme = value;
   }, []);
   useEffect(() => {
     if (!user) return;
+    const invite = pendingInvitation();
+    if (invite) {
+      rememberInvitation(invite);
+      setModal('accept-invite');
+    }
     const params = new URLSearchParams(window.location.search),
-      invite = params.get('invite'),
       verify = params.get('verify');
-    if (!invite && !verify) return;
-    window.history.replaceState(null, '', '/');
-    const operation = invite
-      ? api(`invites/${encodeURIComponent(invite)}`, 'POST', {})
-      : api('auth/verify', 'POST', { token: verify });
-    void operation
-      .then(() => {
-        notify(invite ? 'Invitation accepted. Welcome in.' : 'Email verified.');
-        return qc.invalidateQueries({ queryKey: ['workspace'] });
-      })
-      .catch((e) => setError((e as Error).message));
+    if (verify)
+      void api('auth/verify', 'POST', { token: verify })
+        .then(() => {
+          const url = new URL(location.href);
+          url.searchParams.delete('verify');
+          window.history.replaceState(null, '', url);
+          notify('Email verified.');
+          void qc.invalidateQueries({ queryKey: ['workspace'] });
+        })
+        .catch((e) => setError(e.message));
   }, [user?.id]);
   function toggleTheme() {
     const value = theme === 'dark' ? 'light' : 'dark';
@@ -213,27 +254,8 @@ function RipCordApp() {
     localStorage.setItem('ripcord-theme', value);
   }
   useEffect(() => {
-    if (!workspace) return;
-    if (!initialized) {
-      const saved = localStorage.getItem('ripcord-room'),
-        found = allRooms.find((r) => r.id === saved);
-      setServerId(found?.serverId ?? workspace.servers[0]?.id ?? null);
-      setRoomId(found?.id ?? workspace.servers[0]?.rooms[0]?.id ?? null);
-      setInitialized(true);
-    } else if (roomId && !room) {
-      setRoomId(null);
-      qc.removeQueries({ queryKey: ['messages', roomId] });
-    }
-    if (serverId && !server) setServerId(null);
-  }, [workspace]); // Server responses govern available navigation.
-  useEffect(() => {
-    setContent('');
-    setReply(null);
-    setFiles([]);
     setTyping({});
     setOnline([]);
-    pinned.current = true;
-    if (roomId) localStorage.setItem('ripcord-room', roomId);
     if (socket.current?.connected && roomId) socket.current.emit('subscribe', roomId);
     else socket.current?.emit('unsubscribe');
   }, [roomId]);
@@ -252,7 +274,7 @@ function RipCordApp() {
       setConnected(false);
       setOnline([]);
     });
-    s.on('invalidate', (e: { id: string; type: string; roomId?: string }) => {
+    s.on('invalidate', (e: { id: string; type: string; roomId?: string; serverId?: string }) => {
       if (events.has(e.id)) return;
       events.add(e.id);
       if (events.size > 500) events.delete(events.values().next().value!);
@@ -260,11 +282,15 @@ function RipCordApp() {
       if (e.type === 'permissions' || e.type === 'membership' || e.type === 'conversations') {
         qc.removeQueries({ queryKey: ['messages'] });
         qc.removeQueries({ queryKey: ['search'] });
-      } else void qc.invalidateQueries({ queryKey: ['search'] });
+      } else if (e.type === 'messages') {
+        void qc.invalidateQueries({ queryKey: ['search'] });
+        void qc.invalidateQueries({ queryKey: ['mentions'] });
+      }
       if (e.roomId) void qc.invalidateQueries({ queryKey: ['messages', e.roomId] });
-      else {
+      else if (e.serverId) void qc.invalidateQueries({ queryKey: ['server', e.serverId] });
+      else if (e.type === 'profiles') {
         void qc.invalidateQueries({ queryKey: ['server'] });
-        void qc.invalidateQueries({ queryKey: ['messages'] });
+        void qc.invalidateQueries({ queryKey: ['messages', currentRoom.current] });
       }
     });
     s.on('access.revoked', (e: { roomId: string }) => {
@@ -303,74 +329,39 @@ function RipCordApp() {
     };
   }, [user?.id, qc, accountReset]);
   useEffect(() => {
-    const box = scroller.current;
-    if (box && pinned.current) box.scrollTop = box.scrollHeight;
-    const last = messages.at(-1);
-    if (
-      last &&
-      roomId &&
-      document.visibilityState === 'visible' &&
-      document.hasFocus() &&
-      pinned.current
-    )
-      void api(`rooms/${roomId}/read`, 'POST', { seq: last.seq })
-        .then(() => qc.invalidateQueries({ queryKey: ['workspace'] }))
-        .catch(() => {});
     setPending((old) =>
       old.filter((p) => !messages.some((m) => m.nonce === p.nonce && m.authorId === user?.id)),
     );
-  }, [history.data, roomId, pending.length]);
-  const previousMentions = useRef<Map<string, number> | null>(null);
-  useEffect(() => {
-    if (!workspace) return;
-    const now = new Map(allRooms.map((r) => [r.id, r.mentions]));
-    if (
-      previousMentions.current &&
-      'Notification' in window &&
-      Notification.permission === 'granted'
-    )
-      for (const r of allRooms) {
-        if (
-          r.mentions > (previousMentions.current.get(r.id) ?? r.mentions) &&
-          (r.id !== roomId || document.visibilityState !== 'visible')
-        ) {
-          const n = new Notification('You were mentioned on RipCord', {
-            body: `New mention in ${r.name}`,
-            tag: r.id,
-            icon: '/icon.svg',
-          });
-          n.onclick = () => {
-            window.focus();
-            chooseRoom(r);
-            n.close();
-          };
-        }
-      }
-    previousMentions.current = now;
-  }, [workspace]);
+  }, [history.data]);
   useEffect(() => {
     const handle = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
         e.preventDefault();
-        setModal('search');
+        setModal('switcher');
       }
-      if (e.key === 'Escape') setNavOpen(false);
+      if (e.key === 'Escape') {
+        setNavOpen(false);
+        setShowMembers(false);
+      }
     };
     window.addEventListener('keydown', handle);
     return () => window.removeEventListener('keydown', handle);
   }, []);
-  function chooseRoom(r: ChatRoom) {
-    setRoomId(r.id);
-    setServerId(r.serverId);
+  function chooseRoom(r: ChatRoom, target?: string | null, unread = false) {
+    choose(r, target, unread);
     setNavOpen(false);
     setError('');
   }
   function chooseServer(s: Community) {
     setServerId(s.id);
-    setRoomId(s.rooms[0]?.id ?? null);
+    setRoomId(lastChannel(s.id)?.id ?? s.rooms[0]?.id ?? null);
     setNavOpen(false);
   }
+  const actionLock = useRef(false),
+    draftSubmit = useRef(false);
   async function action(fn: () => Promise<unknown>) {
+    if (actionLock.current) return;
+    actionLock.current = true;
     setError('');
     try {
       await fn();
@@ -378,36 +369,25 @@ function RipCordApp() {
       await qc.invalidateQueries({ queryKey: ['server'] });
     } catch (e) {
       setError((e as Error).message);
-    }
-  }
-  async function transmit(p: Pending) {
-    setPending((old) => old.map((m) => (m.nonce === p.nonce ? { ...m, failed: false } : m)));
-    try {
-      await api(`rooms/${p.roomId}/messages`, 'POST', {
-        content: p.content,
-        nonce: p.nonce,
-        replyId: p.replyId,
-        attachmentIds: p.attachmentIds,
-      });
-      await qc.invalidateQueries({ queryKey: ['messages', p.roomId] });
-      await qc.invalidateQueries({ queryKey: ['workspace'] });
-    } catch (e) {
-      setPending((old) =>
-        old.map((m) =>
-          m.nonce === p.nonce ? { ...m, failed: true, error: (e as Error).message } : m,
-        ),
-      );
+    } finally {
+      actionLock.current = false;
     }
   }
   function send() {
+    if (draftSubmit.current) return;
     if (
       !room ||
       !canSend ||
       (!content.trim() && !files.length) ||
       uploading ||
+      files.some((f) => f.expired) ||
       content.length > workspace!.instance.maxMessageLength
     )
       return;
+    draftSubmit.current = true;
+    queueMicrotask(() => {
+      draftSubmit.current = false;
+    });
     const p = {
       nonce: createMessageNonce(),
       roomId: room.id,
@@ -415,6 +395,9 @@ function RipCordApp() {
       attachmentIds: files.map((f) => f.id),
       replyId: reply?.id,
       failed: false,
+      files,
+      reply,
+      updatedAt: Date.now(),
     };
     setPending((old) => [...old, p]);
     pinned.current = true;
@@ -425,28 +408,8 @@ function RipCordApp() {
     inputRef.current?.focus();
   }
   async function uploadFiles(list: FileList | null) {
-    if (!list || !workspace) return;
-    setUploading(true);
-    setError('');
-    try {
-      if (list.length + files.length > workspace.instance.maxAttachments)
-        throw new Error(`Attach up to ${workspace.instance.maxAttachments} files.`);
-      for (const file of Array.from(list)) {
-        if (file.size > workspace.instance.maxFileBytes)
-          throw new Error(
-            `Files must be smaller than ${Math.round(workspace.instance.maxFileBytes / 1048576)} MB.`,
-          );
-        const form = new FormData();
-        form.set('file', file);
-        const result = await api<{ id: string; name: string }>('uploads', 'POST', form);
-        setFiles((old) => [...old, result]);
-      }
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setUploading(false);
-      if (fileInput.current) fileInput.current.value = '';
-    }
+    if (workspace) await stageFiles(list, workspace.instance);
+    if (fileInput.current) fileInput.current.value = '';
   }
   async function startDm(person: Person) {
     await action(async () => {
@@ -480,7 +443,6 @@ function RipCordApp() {
       <AuthScreen
         info={publicInfo.data}
         onLogin={() => {
-          setInitialized(false);
           // Explicit refetch also works while the reset flow has automatic fetching paused.
           void data.refetch().then((result) => {
             if (result.data) setAccountReset(false);
@@ -511,13 +473,27 @@ function RipCordApp() {
       })) ?? [])
     : (room?.members?.map((m) => m.user) ?? []);
   const onlineIds = new Set(online.map((p) => p.id));
-  const typingNames = Object.values(typing).map((t) => t.name);
+  const typingNames = Object.entries(typing)
+    .filter(([id]) => !blocked.has(id))
+    .map(([, t]) => t.name);
   const mention = content.match(/(?:^|\s)@([\w]*)$/)?.[1];
   const mentionPeople =
     mention !== undefined
       ? displayedMembers.filter((p) => p.username.startsWith(mention)).slice(0, 5)
       : [];
+  const profileRelationship =
+    related.find(
+      (r) => r.kind === 'FRIEND' && (r.fromId === selectedUser?.id || r.toId === selectedUser?.id),
+    ) ??
+    related.find(
+      (r) => r.kind === 'REQUEST' && (r.fromId === selectedUser?.id || r.toId === selectedUser?.id),
+    );
   const closeModal = () => {
+    if (
+      document.querySelector('.settings-layout form[data-dirty="true"]') &&
+      !window.confirm('Discard unsaved settings changes?')
+    )
+      return;
     setModal('');
     setSearchQuery('');
     setError('');
@@ -598,9 +574,11 @@ function RipCordApp() {
         <header className="sidebar-header">
           {server ? (
             <Menu label={server.name}>
-              <MenuItem onClick={() => setModal('invite')}>
-                <UserPlus size={16} /> Invite people
-              </MenuItem>
+              {has(BigInt(server.permissions), P.CREATE_INVITES) && (
+                <MenuItem onClick={() => setModal('invite')}>
+                  <UserPlus size={16} /> Invite people
+                </MenuItem>
+              )}
               {(BigInt(server.permissions) &
                 (P.MANAGE_SERVER |
                   P.MANAGE_ROLES |
@@ -616,8 +594,31 @@ function RipCordApp() {
                   <Settings size={16} /> Server settings
                 </MenuItem>
               )}
-              <MenuItem onClick={() => setModal('leave-server')} danger>
-                <LogOut size={16} /> Leave server
+              <MenuItem
+                onClick={() =>
+                  void action(() =>
+                    api('preferences', 'PUT', {
+                      scope: 'server',
+                      targetId: server.id,
+                      muted: !server.muted,
+                    }),
+                  )
+                }
+              >
+                <Bell size={16} /> {server.muted ? 'Unmute community' : 'Mute community'}
+              </MenuItem>
+              <MenuItem
+                onClick={() => setModal('leave-server')}
+                danger
+                disabled={server.ownerId === user!.id}
+                reason={
+                  server.ownerId === user!.id
+                    ? 'Transfer ownership in settings before leaving.'
+                    : undefined
+                }
+              >
+                <LogOut size={16} />{' '}
+                {server.ownerId === user!.id ? 'Transfer ownership before leaving' : 'Leave server'}
               </MenuItem>
             </Menu>
           ) : (
@@ -625,6 +626,18 @@ function RipCordApp() {
           )}
         </header>
         <div className="sidebar-scroll">
+          <button className="friends-nav" onClick={() => setModal('unread')}>
+            <MessageCircle size={18} /> Unread{' '}
+            <span className="count-badge">
+              {allRooms.reduce((total, r) => total + r.unread, 0)}
+            </span>
+          </button>
+          <button className="friends-nav" onClick={() => setModal('mentions')}>
+            <Bell size={18} /> Mentions{' '}
+            <span className="count-badge">
+              {allRooms.reduce((total, r) => total + r.mentions, 0)}
+            </span>
+          </button>
           {server ? (
             <>
               <div className="community-summary">
@@ -692,16 +705,18 @@ function RipCordApp() {
                       ))}
                 </div>
               ))}
-              <button className="invite-nudge" onClick={() => setModal('invite')}>
-                <span>
-                  <UserPlus size={17} />
-                  <strong>Better together</strong>
-                </span>
-                <p>Bring your people into the conversation.</p>
-                <span className="nudge-link">
-                  Invite a friend <ArrowUp size={13} />
-                </span>
-              </button>
+              {has(BigInt(server.permissions), P.CREATE_INVITES) && (
+                <button className="invite-nudge" onClick={() => setModal('invite')}>
+                  <span>
+                    <UserPlus size={17} />
+                    <strong>Better together</strong>
+                  </span>
+                  <p>Bring your people into the conversation.</p>
+                  <span className="nudge-link">
+                    Invite a friend <ArrowUp size={13} />
+                  </span>
+                </button>
+              )}
             </>
           ) : (
             <>
@@ -716,7 +731,7 @@ function RipCordApp() {
                   </span>
                 )}
               </button>
-              <button className="find-conversation" onClick={() => setModal('search')}>
+              <button className="find-conversation" onClick={() => setModal('switcher')}>
                 <Search size={15} /> Find a conversation <kbd>⌘ K</kbd>
               </button>
               <div className="sidebar-section-label">
@@ -774,6 +789,7 @@ function RipCordApp() {
               onClick={() =>
                 void action(async () => {
                   await api('auth/logout', 'POST', {});
+                  clearWork(user!.id);
                   qc.clear();
                   window.location.reload();
                 })
@@ -819,6 +835,24 @@ function RipCordApp() {
             </>
           )}
           <div className="header-actions">
+            {room && (
+              <Menu label="Conversation options" trigger={<MoreHorizontal size={19} />}>
+                <MenuItem
+                  onClick={() =>
+                    void action(() =>
+                      api('preferences', 'PUT', {
+                        scope: 'room',
+                        targetId: room.id,
+                        muted: !room.muted,
+                      }),
+                    )
+                  }
+                >
+                  {room.muted ? 'Unmute conversation' : 'Mute conversation'}
+                </MenuItem>
+                <MenuItem onClick={() => setModal('switcher')}>Switch conversation</MenuItem>
+              </Menu>
+            )}
             {room?.kind === 'GROUP' && (
               <button
                 className="icon-button"
@@ -855,7 +889,6 @@ function RipCordApp() {
             </button>
             <button className="header-search" onClick={() => setModal('search')}>
               <span>Search</span>
-              <kbd>⌘ K</kbd>
               <Search size={15} />
             </button>
           </div>
@@ -872,10 +905,12 @@ function RipCordApp() {
               <div
                 ref={scroller}
                 className="message-scroll"
-                onScroll={(e) => {
-                  const el = e.currentTarget;
-                  pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
-                }}
+                onScroll={onScroll}
+                onWheel={enableReads}
+                onTouchStart={enableReads}
+                onKeyDown={enableReads}
+                onPointerDown={enableReads}
+                tabIndex={0}
               >
                 <div className="channel-welcome">
                   <div className="welcome-hash">
@@ -902,8 +937,7 @@ function RipCordApp() {
                     className="load-history"
                     disabled={history.isFetchingNextPage}
                     onClick={() => {
-                      pinned.current = false;
-                      void history.fetchNextPage();
+                      void loadEarlier();
                     }}
                   >
                     {history.isFetchingNextPage ? 'Loading…' : 'Load earlier messages'}
@@ -924,11 +958,14 @@ function RipCordApp() {
                       previous={messages[i - 1]}
                       userId={user!.id}
                       blocked={blocked.has(message.authorId)}
+                      replyBlocked={!!message.reply && blocked.has(message.reply.author.id)}
                       canModerate={
                         room.kind === 'TEXT' && has(BigInt(room.permissions), P.MANAGE_MESSAGES)
                       }
                       canReact={has(BigInt(room.permissions), P.ADD_REACTIONS)}
                       canSend={canSend}
+                      onJump={() => chooseRoom(room, message.reply?.id)}
+                      highlighted={message.id === messageTarget}
                       onReply={() => {
                         setReply(message);
                         inputRef.current?.focus();
@@ -957,11 +994,21 @@ function RipCordApp() {
                             </button>
                             <button
                               className="text-button"
-                              onClick={() =>
-                                setPending((old) => old.filter((m) => m.nonce !== p.nonce))
-                              }
+                              onClick={() => void reconcile(p, 'check')}
                             >
-                              Dismiss
+                              Check status
+                            </button>
+                            <button
+                              className="text-button"
+                              onClick={() => void reconcile(p, 'edit')}
+                            >
+                              Edit
+                            </button>
+                            <button
+                              className="text-button"
+                              onClick={() => void reconcile(p, 'discard')}
+                            >
+                              Discard
                             </button>
                           </span>
                         ) : (
@@ -971,6 +1018,28 @@ function RipCordApp() {
                     </div>
                   ))}
               </div>
+              {hasNewer && (
+                <button
+                  className="load-history"
+                  disabled={loadingNewer}
+                  onClick={() => void loadNewer()}
+                >
+                  {loadingNewer ? 'Loading…' : 'Load newer messages'}
+                </button>
+              )}
+              {(!atLatest || !!messageTarget) && (
+                <button
+                  className="secondary-button jump-latest"
+                  onClick={() => {
+                    pinned.current = true;
+                    setMessageTarget(null);
+                    void qc.invalidateQueries({ queryKey: ['messages', roomId, null] });
+                    scroller.current?.scrollTo?.({ top: scroller.current.scrollHeight });
+                  }}
+                >
+                  Jump to latest
+                </button>
+              )}
               <div className="composer-area">
                 {reply && (
                   <div className="reply-strip">
@@ -991,6 +1060,7 @@ function RipCordApp() {
                       <span key={f.id}>
                         <Paperclip size={14} />
                         {f.name}
+                        {f.expired && <strong> · Expired — remove and reattach</strong>}
                         <button
                           aria-label={`Remove ${f.name}`}
                           onClick={() => setFiles((old) => old.filter((v) => v.id !== f.id))}
@@ -1082,6 +1152,7 @@ function RipCordApp() {
                       !canSend ||
                       (!content.trim() && !files.length) ||
                       uploading ||
+                      files.some((f) => f.expired) ||
                       content.length > workspace.instance.maxMessageLength
                     }
                     onClick={send}
@@ -1122,6 +1193,13 @@ function RipCordApp() {
                 </div>
               </div>
             </div>
+            {showMembers && (
+              <button
+                className="members-backdrop"
+                aria-label="Close member list"
+                onClick={() => setShowMembers(false)}
+              />
+            )}
             {showMembers && (
               <aside className="members-sidebar">
                 <div className="members-title">
@@ -1206,6 +1284,32 @@ function RipCordApp() {
           />
         )}
       </main>
+      <QuickSwitcher
+        workspace={workspace}
+        open={modal === 'switcher'}
+        onClose={closeModal}
+        onChoose={chooseRoom}
+      />
+      <CatchUp
+        workspace={workspace}
+        mode={modal === 'unread' || modal === 'mentions' ? modal : null}
+        onClose={closeModal}
+        onChoose={chooseRoom}
+      />
+      <Modal title="Accept invitation" open={modal === 'accept-invite'} onClose={closeModal}>
+        <div className="modal-body">
+          <InvitationForm
+            initial={pendingInvitation()}
+            onJoined={async (result) => {
+              await qc.invalidateQueries({ queryKey: ['workspace'] });
+              setServerId(result.serverId);
+              setRoomId(result.server?.rooms[0]?.id ?? null);
+              closeModal();
+              notify('Invitation accepted. Welcome in.');
+            }}
+          />
+        </div>
+      </Modal>
       {notice && (
         <div className="toast" role="status">
           <Check size={17} />
@@ -1274,28 +1378,15 @@ function RipCordApp() {
             </button>
           </form>
           <div className="form-divider">ALREADY HAVE AN INVITATION?</div>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              const f = new FormData(e.currentTarget);
-              const code =
-                String(f.get('invite')).split('invite=')[1]?.split('&')[0] ??
-                String(f.get('invite'));
-              void action(async () => {
-                await api(`invites/${encodeURIComponent(code)}`, 'POST', {});
-                closeModal();
-                notify('You joined the server.');
-              });
+          <InvitationForm
+            onJoined={async (result) => {
+              await qc.invalidateQueries({ queryKey: ['workspace'] });
+              setServerId(result.serverId);
+              setRoomId(result.server?.rooms[0]?.id ?? null);
+              closeModal();
+              notify('Invitation accepted. Welcome in.');
             }}
-          >
-            <label>
-              INVITATION CODE
-              <input name="invite" required placeholder="Paste a code or invitation link" />
-            </label>
-            <button className="secondary-button full">
-              <LinkIcon size={16} /> Join server
-            </button>
-          </form>
+          />
           <ErrorNote error={error} />
         </div>
       </Modal>
@@ -1351,7 +1442,13 @@ function RipCordApp() {
               <select name="privateRoleId">
                 <option value="">Everyone in the server</option>
                 {details.data?.roles
-                  .filter((r) => !r.everyone)
+                  .filter(
+                    (r) =>
+                      !r.everyone &&
+                      !!server &&
+                      has(BigInt(server.permissions), P.MANAGE_ROLES) &&
+                      (server.ownerId === user!.id || r.position < (details.data?.position ?? 0)),
+                  )
                   .map((r) => (
                     <option key={r.id} value={r.id}>
                       Private: {r.name}
@@ -1423,11 +1520,8 @@ function RipCordApp() {
                 key={m.id}
                 onClick={() => {
                   const r = allRooms.find((v) => v.id === m.roomId);
-                  if (r) chooseRoom(r);
+                  if (r) chooseRoom(r, m.id);
                   closeModal();
-                  notify(
-                    'Conversation opened. Older results are available through Load earlier messages.',
-                  );
                 }}
               >
                 <Avatar user={m.author} size="small" />
@@ -1437,7 +1531,7 @@ function RipCordApp() {
                     {allRooms.find((r) => r.id === m.roomId)?.name} ·{' '}
                     {new Date(m.createdAt).toLocaleDateString()}
                   </small>
-                  <p>{m.content}</p>
+                  <p>{blocked.has(m.authorId) ? 'Message from a blocked user' : m.content}</p>
                 </span>
               </button>
             ))}
@@ -1491,17 +1585,36 @@ function RipCordApp() {
                 </button>
                 <button
                   className="secondary-button full"
+                  disabled={
+                    blocked.has(selectedUser.id) ||
+                    profileRelationship?.kind === 'FRIEND' ||
+                    (profileRelationship?.kind === 'REQUEST' &&
+                      profileRelationship.fromId === user!.id)
+                  }
                   onClick={() =>
                     void action(async () => {
                       await api('relationships', 'POST', {
                         userId: selectedUser.id,
-                        action: 'request',
+                        action: profileRelationship?.kind === 'REQUEST' ? 'accept' : 'request',
                       });
-                      notify('Friend request sent.');
+                      notify(
+                        profileRelationship?.kind === 'REQUEST'
+                          ? 'Friend request accepted.'
+                          : 'Friend request sent.',
+                      );
                     })
                   }
                 >
-                  <UserPlus size={17} /> Add friend
+                  <UserPlus size={17} />{' '}
+                  {blocked.has(selectedUser.id)
+                    ? 'Blocked'
+                    : profileRelationship?.kind === 'FRIEND'
+                      ? 'Friends'
+                      : profileRelationship?.kind === 'REQUEST'
+                        ? profileRelationship.fromId === user!.id
+                          ? 'Request sent'
+                          : 'Accept request'
+                        : 'Add friend'}
                 </button>
                 <button
                   className="text-button danger-text"
@@ -1583,17 +1696,23 @@ function RipCordApp() {
                 <>
                   <button
                     className="text-button"
-                    onClick={() =>
-                      void action(() => api(`rooms/${roomId}`, 'PATCH', { ownerId: m.user.id }))
-                    }
+                    onClick={() => {
+                      if (
+                        window.confirm(
+                          `Transfer group ownership to ${m.user.displayName}? They will control membership.`,
+                        )
+                      )
+                        void action(() => api(`rooms/${roomId}`, 'PATCH', { ownerId: m.user.id }));
+                    }}
                   >
                     Make owner
                   </button>
                   <button
                     className="text-button danger-text"
-                    onClick={() =>
-                      void action(() => api(`rooms/${roomId}/members/${m.user.id}`, 'DELETE'))
-                    }
+                    onClick={() => {
+                      if (window.confirm(`Remove ${m.user.displayName} from this group?`))
+                        void action(() => api(`rooms/${roomId}/members/${m.user.id}`, 'DELETE'));
+                    }}
                   >
                     Remove
                   </button>
@@ -1619,27 +1738,6 @@ function RipCordApp() {
     </div>
   );
 }
-export type ServerInfo = Omit<Community, 'rooms' | 'categories'> & {
-  position: number;
-  roles: {
-    id: string;
-    name: string;
-    color: string;
-    position: number;
-    permissions: string;
-    everyone: boolean;
-  }[];
-  members: {
-    id: string;
-    user: Person;
-    nickname: string | null;
-    timeoutUntil: string | null;
-    roles: { role: { id: string; name: string; color: string; position: number } }[];
-  }[];
-  rooms: (ChatRoom & { overrides: OverrideData[] })[];
-  categories: { id: string; name: string; position: number; overrides: OverrideData[] }[];
-};
-export type OverrideData = { targetType: string; targetId: string; allow: string; deny: string };
 function InviteForm({
   serverId,
   onError,
@@ -1649,11 +1747,14 @@ function InviteForm({
 }) {
   const [link, setLink] = useState(''),
     [busy, setBusy] = useState(false);
+  const lock = useRef(false);
   return (
     <div className="modal-body">
       <form
         onSubmit={async (e) => {
           e.preventDefault();
+          if (lock.current) return;
+          lock.current = true;
           setBusy(true);
           const f = new FormData(e.currentTarget);
           try {
@@ -1669,6 +1770,7 @@ function InviteForm({
           } catch (e) {
             onError((e as Error).message);
           } finally {
+            lock.current = false;
             setBusy(false);
           }
         }}
@@ -1720,6 +1822,7 @@ function NewDm({
     [name, setName] = useState(''),
     [error, setError] = useState(''),
     [busy, setBusy] = useState(false);
+  const lock = useRef(false);
   const users = useQuery({
     queryKey: ['users', q],
     queryFn: () => api<Person[]>(`users?q=${encodeURIComponent(q)}`),
@@ -1744,6 +1847,10 @@ function NewDm({
           </button>
         ))}
       </div>
+      {q.length >= 2 && users.isFetching && <p className="muted">Finding people…</p>}
+      {q.length >= 2 && !users.isFetching && users.data?.length === 0 && (
+        <p className="muted">No people found.</p>
+      )}
       {users.data?.map((p) => (
         <button
           className="person-result"
@@ -1776,6 +1883,8 @@ function NewDm({
         className="primary-button full"
         disabled={!selected.length || busy}
         onClick={async () => {
+          if (lock.current) return;
+          lock.current = true;
           setBusy(true);
           try {
             const room = await api<ChatRoom>('dms', 'POST', {
@@ -1786,6 +1895,7 @@ function NewDm({
           } catch (e) {
             setError((e as Error).message);
           } finally {
+            lock.current = false;
             setBusy(false);
           }
         }}
@@ -1808,7 +1918,9 @@ function GroupMemberForm({
   onChanged: () => void;
   onError: (v: string) => void;
 }) {
-  const [q, setQ] = useState('');
+  const [q, setQ] = useState(''),
+    [busy, setBusy] = useState(false);
+  const lock = useRef(false);
   const users = useQuery({
     queryKey: ['users', q],
     queryFn: () => api<Person[]>(`users?q=${encodeURIComponent(q)}`),
@@ -1820,19 +1932,29 @@ function GroupMemberForm({
         ADD A MEMBER
         <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Find by username" />
       </label>
+      {q.length >= 2 && users.isFetching && <p className="muted">Finding people…</p>}
+      <ErrorNote error={users.error?.message} />
+      {q.length >= 2 && users.data?.length === 0 && <p className="muted">No people found.</p>}
       {users.data
         ?.filter((p) => !room.members?.some((m) => m.user.id === p.id))
         .map((p) => (
           <button
             key={p.id}
             className="person-result"
+            disabled={busy}
             onClick={async () => {
+              if (lock.current) return;
+              lock.current = true;
+              setBusy(true);
               try {
                 await api(`rooms/${room.id}/members`, 'POST', { userId: p.id });
                 setQ('');
                 onChanged();
               } catch (e) {
                 onError((e as Error).message);
+              } finally {
+                lock.current = false;
+                setBusy(false);
               }
             }}
           >
@@ -1849,10 +1971,13 @@ function Message({
   previous,
   userId,
   blocked,
+  replyBlocked,
   canModerate,
   canReact,
   canSend,
   onReply,
+  onJump,
+  highlighted,
   onProfile,
   onChanged,
   onError,
@@ -1861,10 +1986,13 @@ function Message({
   previous?: ChatMessage;
   userId: string;
   blocked: boolean;
+  replyBlocked: boolean;
   canModerate: boolean;
   canReact: boolean;
   canSend: boolean;
   onReply: () => void;
+  onJump: () => void;
+  highlighted: boolean;
   onProfile: () => void;
   onChanged: () => void;
   onError: (e: string) => void;
@@ -1872,7 +2000,10 @@ function Message({
   const [editing, setEditing] = useState(false),
     [content, setContent] = useState(m.content ?? ''),
     [confirm, setConfirm] = useState(''),
-    [expanded, setExpanded] = useState(false);
+    [expanded, setExpanded] = useState(false),
+    [mutating, setMutating] = useState(false),
+    [mutationError, setMutationError] = useState('');
+  const mutationLock = useRef(false);
   const date = new Date(m.createdAt),
     prior = previous ? new Date(previous.createdAt) : null;
   const newDay = !prior || date.toDateString() !== prior.toDateString();
@@ -1887,13 +2018,20 @@ function Message({
     reactions.set(r.emoji, { count: current.count + 1, own: current.own || r.userId === userId });
   }
   async function mutate(path: string, method: string, data?: unknown) {
+    if (mutationLock.current) return false;
+    mutationLock.current = true;
+    setMutating(true);
+    setMutationError('');
     try {
       await api(path, method, data);
       onChanged();
       return true;
     } catch (e) {
-      onError((e as Error).message);
+      setMutationError((e as Error).message);
       return false;
+    } finally {
+      mutationLock.current = false;
+      setMutating(false);
     }
   }
   return (
@@ -1906,18 +2044,24 @@ function Message({
         </div>
       )}
       <article
-        className={`message ${grouped ? 'grouped' : ''} ${m.reply ? 'has-reply' : ''} ${m.deletedAt ? 'deleted' : ''}`}
+        aria-busy={mutating}
+        data-message-id={m.id}
+        data-seq={m.seq}
+        tabIndex={-1}
+        className={`message ${highlighted ? 'message-target' : ''} ${grouped ? 'grouped' : ''} ${m.reply ? 'has-reply' : ''} ${m.deletedAt ? 'deleted' : ''}`}
       >
-        {m.reply && (
-          <div className="message-reply">
+        {m.reply && (!blocked || expanded) && (
+          <button type="button" className="message-reply" onClick={onJump}>
             <Reply size={13} />
             <strong>{m.reply.author.displayName}</strong>
             <span>
-              {m.reply.deletedAt
-                ? 'Original message deleted'
-                : m.reply.content?.slice(0, 120) || 'Attachment'}
+              {replyBlocked
+                ? 'Reply to a blocked user'
+                : m.reply.deletedAt
+                  ? 'Original message deleted'
+                  : m.reply.content?.slice(0, 120) || 'Attachment'}
             </span>
-          </div>
+          </button>
         )}
         {!grouped ? (
           <Avatar user={m.author} onClick={onProfile} />
@@ -1955,11 +2099,14 @@ function Message({
                 autoFocus
                 required
               />
+              <ErrorNote error={mutationError} />
               <span>
                 <button type="button" className="text-button" onClick={() => setEditing(false)}>
                   Cancel
                 </button>
-                <button className="primary-button">Save</button>
+                <button className="primary-button" disabled={mutating}>
+                  Save
+                </button>
               </span>
             </form>
           ) : (
@@ -2029,7 +2176,7 @@ function Message({
                 {[...reactions].map(([emoji, r]) => (
                   <button
                     key={emoji}
-                    disabled={!canReact}
+                    disabled={!canReact || mutating}
                     className={r.own ? 'own' : ''}
                     aria-label={`React ${emoji}, ${r.count} reactions`}
                     onClick={() => void mutate(`messages/${m.id}/reactions`, 'POST', { emoji })}
@@ -2062,6 +2209,29 @@ function Message({
               </button>
             )}
             <Menu label="Message actions" trigger={<MoreHorizontal size={16} />}>
+              <MenuItem
+                onClick={() =>
+                  void navigator.clipboard
+                    .writeText(messageLink(m.roomId, m.id))
+                    .catch((e) => onError(e.message))
+                }
+              >
+                <LinkIcon size={15} /> Copy message link
+              </MenuItem>
+              {canSend && (
+                <MenuItem onClick={onReply}>
+                  <Reply size={15} /> Reply
+                </MenuItem>
+              )}
+              {canReact &&
+                ['👍', '❤️', '😂', '🎉'].map((emoji) => (
+                  <MenuItem
+                    key={emoji}
+                    onClick={() => void mutate(`messages/${m.id}/reactions`, 'POST', { emoji })}
+                  >
+                    React {emoji}
+                  </MenuItem>
+                ))}
               {m.authorId === userId && canSend && (
                 <MenuItem
                   onClick={() => {
@@ -2090,39 +2260,44 @@ function Message({
         onClose={() => setConfirm('')}
       >
         <div className="modal-body">
-          {confirm === 'delete' ? (
-            <>
-              <p>The message content and its attachments will be removed. This cannot be undone.</p>
-              <button
-                className="danger-button full"
-                onClick={async () => {
-                  if (await mutate(`messages/${m.id}`, 'DELETE')) setConfirm('');
+          <ErrorNote error={mutationError} />
+          <fieldset disabled={mutating}>
+            {confirm === 'delete' ? (
+              <>
+                <p>
+                  The message content and its attachments will be removed. This cannot be undone.
+                </p>
+                <button
+                  className="danger-button full"
+                  onClick={async () => {
+                    if (await mutate(`messages/${m.id}`, 'DELETE')) setConfirm('');
+                  }}
+                >
+                  Delete message
+                </button>
+              </>
+            ) : (
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  const f = new FormData(e.currentTarget);
+                  if (await mutate('reports', 'POST', { messageId: m.id, reason: f.get('reason') }))
+                    setConfirm('');
                 }}
               >
-                Delete message
-              </button>
-            </>
-          ) : (
-            <form
-              onSubmit={async (e) => {
-                e.preventDefault();
-                const f = new FormData(e.currentTarget);
-                if (await mutate('reports', 'POST', { messageId: m.id, reason: f.get('reason') }))
-                  setConfirm('');
-              }}
-            >
-              <label>
-                WHAT HAPPENED?
-                <textarea
-                  name="reason"
-                  required
-                  maxLength={1000}
-                  placeholder="Tell the moderators what they should know."
-                />
-              </label>
-              <button className="primary-button full">Submit report</button>
-            </form>
-          )}
+                <label>
+                  WHAT HAPPENED?
+                  <textarea
+                    name="reason"
+                    required
+                    maxLength={1000}
+                    placeholder="Tell the moderators what they should know."
+                  />
+                </label>
+                <button className="primary-button full">Submit report</button>
+              </form>
+            )}
+          </fieldset>
         </div>
       </Modal>
     </>

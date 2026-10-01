@@ -2,12 +2,14 @@ import type { Prisma } from '@prisma/client';
 import { db } from './db';
 import { instance, personSelect } from './auth';
 import { assert } from './errors';
-import { serverAccess, roomAccess, dmSendAccess } from './access';
+import { mentionTokens } from './mentions';
+import { accessibleRooms, roomAccess, dmSendAccess } from './access';
 import { P, has } from './permissions';
 
 export const messageInclude = {
   author: { select: personSelect },
   attachments: { select: { id: true, name: true, mime: true, size: true } },
+  mentions: { select: { userId: true } },
   reactions: { select: { userId: true, emoji: true } },
   reply: { select: { id: true, content: true, deletedAt: true, author: { select: personSelect } } },
 } as const;
@@ -18,7 +20,8 @@ export const event = (
   scope: string,
   targetId: string,
   type: string,
-) => tx.event.create({ data: { scope, targetId, type } });
+  messageId?: string,
+) => tx.event.create({ data: { scope, targetId, type, messageId } });
 export const audit = (
   tx: Prisma.TransactionClient,
   actorId: string,
@@ -44,70 +47,69 @@ export async function roomTransaction<T>(
 export async function workspace(userId: string) {
   const user = await db.user.findUniqueOrThrow({
     where: { id: userId },
-    select: { ...personSelect, isAdmin: true, friendsOnly: true, email: true, emailVerified: true },
-  });
-  const settings = await instance();
-  const memberships = await db.membership.findMany({
-    where: { userId },
-    include: {
-      server: {
-        include: {
-          categories: { orderBy: { position: 'asc' } },
-          rooms: { orderBy: { position: 'asc' } },
-        },
-      },
+    select: {
+      ...personSelect,
+      isAdmin: true,
+      friendsOnly: true,
+      email: true,
+      emailVerified: true,
+      notifyMentions: true,
+      notifyDms: true,
     },
   });
-  async function decorate(roomId: string) {
-    try {
-      const { room, permissions } = await roomAccess(userId, roomId);
-      const read = await db.readPosition.findUnique({
-        where: { userId_roomId: { userId, roomId } },
-      });
-      const where = {
-        roomId,
-        seq: { gt: read?.seq ?? 0n },
-        deletedAt: null,
-        authorId: { not: userId },
-      };
-      const history = has(permissions, P.READ_HISTORY);
-      const unread = history ? await db.message.count({ where }) : 0;
-      const mentions = history
-        ? await db.message.count({
-            where: {
-              ...where,
-              OR: [
-                { content: { contains: `@${user.username}` } },
-                { content: { contains: '@everyone' } },
-                { content: { contains: '@here' } },
-              ],
-            },
-          })
-        : 0;
-      const { overrides: _o, category: _c, members: _m, ...data } = room;
-      const members =
-        room.kind !== 'TEXT'
-          ? await db.roomMember.findMany({
-              where: { roomId },
-              include: { user: { select: personSelect } },
-            })
-          : undefined;
-      return { ...data, permissions, unread, mentions, members };
-    } catch {
-      return null;
-    }
-  }
-  const servers = [];
-  for (const { server } of memberships) {
-    const access = await serverAccess(userId, server.id);
-    const rooms = (await Promise.all(server.rooms.map((r) => decorate(r.id)))).filter(Boolean);
-    servers.push({ ...server, rooms, permissions: access.permissions });
-  }
-  const dmRooms = await db.room.findMany({
-    where: { kind: { not: 'TEXT' }, members: { some: { userId } } },
-    orderBy: { createdAt: 'asc' },
+  const settings = await instance();
+  const snapshot = await accessibleRooms(userId);
+  const ids = snapshot.rooms.filter((r) => has(r.permissions, P.READ_HISTORY)).map((r) => r.id);
+  const reads = await db.readPosition.findMany({ where: { userId, roomId: { in: ids } } });
+  const preferences = await db.notificationPreference.findMany({ where: { userId } });
+  const counts = ids.length
+    ? await db.$queryRaw<
+        {
+          roomId: string;
+          unread: bigint;
+          mentions: bigint;
+          firstUnreadId: string | null;
+          latestSeq: bigint | null;
+          lastActivityAt: Date | null;
+          latestEvent: bigint | null;
+        }[]
+      >`
+    SELECT r."id" AS "roomId",
+      COUNT(m."id") FILTER (WHERE m."seq" > COALESCE(p."seq", 0) AND m."deletedAt" IS NULL AND m."authorId" <> ${userId}) AS unread,
+      COUNT(m."id") FILTER (WHERE m."seq" > COALESCE(p."seq", 0) AND m."deletedAt" IS NULL AND mm."userId" IS NOT NULL) AS mentions,
+      (array_agg(m."id" ORDER BY m."seq") FILTER (WHERE m."seq" > COALESCE(p."seq", 0) AND m."deletedAt" IS NULL AND m."authorId" <> ${userId}))[1] AS "firstUnreadId",
+      MAX(m."seq") AS "latestSeq", MAX(m."createdAt") AS "lastActivityAt",
+      (SELECT MAX(e."id") FROM "Event" e WHERE e."scope" = 'room' AND e."targetId" = r."id" AND e."type" = 'messages') AS "latestEvent"
+    FROM "Room" r LEFT JOIN "Message" m ON m."roomId" = r."id"
+    LEFT JOIN "ReadPosition" p ON p."roomId" = r."id" AND p."userId" = ${userId}
+    LEFT JOIN "MessageMention" mm ON mm."messageId" = m."id" AND mm."userId" = ${userId}
+    WHERE r."id" = ANY(${ids}::text[]) GROUP BY r."id", p."seq"`
+    : [];
+  const decorated = snapshot.rooms.map((room) => {
+    const count = counts.find((c) => c.roomId === room.id);
+    return {
+      ...room,
+      unread: Number(count?.unread ?? 0),
+      mentions: Number(count?.mentions ?? 0),
+      readSeq: reads.find((r) => r.roomId === room.id)?.seq ?? 0n,
+      firstUnreadId: count?.firstUnreadId ?? null,
+      latestSeq: count?.latestSeq ?? null,
+      latestEvent: count?.latestEvent ?? 0n,
+      lastActivityAt: count?.lastActivityAt ?? room.createdAt,
+      muted: preferences.some((p) => p.muted && p.scope === 'room' && p.targetId === room.id),
+    };
   });
-  const dms = (await Promise.all(dmRooms.map((r) => decorate(r.id)))).filter(Boolean);
+  const servers = snapshot.servers.map((access) => ({
+    ...access.member.server,
+    permissions: access.permissions,
+    rooms: decorated.filter((r) => r.serverId === access.member.serverId),
+    muted: preferences.some(
+      (p) => p.muted && p.scope === 'server' && p.targetId === access.member.serverId,
+    ),
+  }));
+  const dms = decorated
+    .filter((r) => r.kind !== 'TEXT')
+    .sort((a, b) => b.lastActivityAt.getTime() - a.lastActivityAt.getTime());
   const relationships = await db.relationship.findMany({
     where: { OR: [{ fromId: userId }, { toId: userId, kind: { not: 'BLOCK' } }] },
   });
@@ -163,7 +165,7 @@ export async function sendMessage(
   );
   return roomTransaction(roomId, async (tx) => {
     const { room, permissions, server } = await roomAccess(userId, roomId, P.SEND_MESSAGES, tx);
-    if (room.kind !== 'TEXT')
+    if (room.kind === 'DIRECT')
       await dmSendAccess(
         userId,
         room.members.map((m) => m.userId),
@@ -174,7 +176,17 @@ export async function sendMessage(
       include: messageInclude,
     });
     if (existing) return existing;
-    if (/@(?:everyone|here)\b/.test(input.content) && room.kind === 'TEXT')
+    assert(
+      !(await tx.sendCancellation.findUnique({
+        where: { authorId_roomId_nonce: { authorId: userId, roomId, nonce: input.nonce } },
+      })),
+      409,
+      'This send was discarded. Create a new message to send it.',
+    );
+    if (
+      [...mentionTokens(input.content)].some((t) => t === 'everyone' || t === 'here') &&
+      room.kind === 'TEXT'
+    )
       assert(
         has(permissions, P.MENTION_EVERYONE),
         403,
@@ -184,7 +196,12 @@ export async function sendMessage(
       await lock(tx, 'storage');
       assert(has(permissions, P.ATTACH_FILES), 403, 'You cannot attach files in this channel.');
       const files = await tx.attachment.findMany({
-        where: { id: { in: input.attachmentIds }, ownerId: userId, messageId: null },
+        where: {
+          id: { in: input.attachmentIds },
+          ownerId: userId,
+          messageId: null,
+          createdAt: { gt: new Date(Date.now() - 86400000) },
+        },
       });
       assert(
         files.length === input.attachmentIds.length &&
@@ -231,8 +248,9 @@ export async function sendMessage(
       },
       include: messageInclude,
     });
-    await event(tx, 'room', roomId, 'messages');
-    return message;
+    await persistMentions(tx, room, userId, message.id, input.content);
+    await event(tx, 'room', roomId, 'messages', message.id);
+    return tx.message.findUniqueOrThrow({ where: { id: message.id }, include: messageInclude });
   });
 }
 export async function modifyMessage(userId: string, messageId: string, content?: string) {
@@ -257,13 +275,16 @@ export async function modifyMessage(userId: string, messageId: string, content?:
     );
     if (content !== undefined) {
       await roomAccess(userId, found.roomId, P.SEND_MESSAGES, tx);
-      if (!access.server)
+      if (access.room.kind === 'DIRECT')
         await dmSendAccess(
           userId,
           access.room.members.map((m) => m.userId),
           tx,
         );
-      if (/@(?:everyone|here)\b/.test(content) && access.server)
+      if (
+        [...mentionTokens(content)].some((t) => t === 'everyone' || t === 'here') &&
+        access.server
+      )
         assert(has(access.permissions, P.MENTION_EVERYONE), 403, 'You cannot mention everyone.');
     } else {
       await lock(tx, 'storage');
@@ -280,8 +301,9 @@ export async function modifyMessage(userId: string, messageId: string, content?:
           : { content, editedAt: new Date() },
       include: messageInclude,
     });
-    await event(tx, 'room', found.roomId, 'messages');
-    return result;
+    await persistMentions(tx, access.room, message.authorId, messageId, content ?? '');
+    await event(tx, 'room', found.roomId, 'messages', result.id);
+    return tx.message.findUniqueOrThrow({ where: { id: result.id }, include: messageInclude });
   });
 }
 export async function react(userId: string, messageId: string, emoji: string) {
@@ -301,7 +323,7 @@ export async function react(userId: string, messageId: string, emoji: string) {
       400,
       'This message was deleted.',
     );
-    if (room.kind !== 'TEXT')
+    if (room.kind === 'DIRECT')
       await dmSendAccess(
         userId,
         room.members.map((m) => m.userId),
@@ -330,28 +352,15 @@ export async function searchMessages(
   roomId?: string,
   serverId?: string,
 ) {
-  const candidates = roomId
-    ? [{ id: roomId }]
-    : await db.room.findMany({
-        where: serverId
-          ? { serverId }
-          : {
-              OR: [
-                { server: { members: { some: { userId } } } },
-                { members: { some: { userId } } },
-              ],
-            },
-        select: { id: true },
-      });
-  const ids: string[] = [];
-  for (const r of candidates) {
-    try {
-      await roomAccess(userId, r.id, P.READ_HISTORY);
-      ids.push(r.id);
-    } catch {
-      /* inaccessible rooms are excluded */
-    }
-  }
+  const snapshot = await accessibleRooms(userId);
+  const ids = snapshot.rooms
+    .filter(
+      (r) =>
+        has(r.permissions, P.READ_HISTORY) &&
+        (!roomId || r.id === roomId) &&
+        (!serverId || r.serverId === serverId),
+    )
+    .map((r) => r.id);
   if (!ids.length) return [];
   const matches = await db.$queryRaw<
     { id: string }[]
@@ -360,5 +369,149 @@ export async function searchMessages(
     where: { id: { in: matches.map((m) => m.id) } },
     include: messageInclude,
     orderBy: { seq: 'desc' },
+  });
+}
+
+async function persistMentions(
+  tx: Prisma.TransactionClient,
+  room: { id: string; serverId: string | null },
+  authorId: string,
+  messageId: string,
+  content: string,
+) {
+  const tokens = mentionTokens(content);
+  await tx.messageMention.deleteMany({ where: { messageId } });
+  if (!tokens.size) return;
+  const members = room.serverId
+    ? (
+        await tx.membership.findMany({
+          where: { serverId: room.serverId },
+          include: { user: { select: { id: true, username: true } } },
+        })
+      ).map((m) => m.user)
+    : (
+        await tx.roomMember.findMany({
+          where: { roomId: room.id },
+          include: { user: { select: { id: true, username: true } } },
+        })
+      ).map((m) => m.user);
+  const recipients = members.filter(
+    (u) =>
+      u.id !== authorId && (tokens.has(u.username) || tokens.has('everyone') || tokens.has('here')),
+  );
+  await tx.messageMention.createMany({
+    data: recipients.map((u) => ({ messageId, userId: u.id })),
+    skipDuplicates: true,
+  });
+}
+export async function messageContext(userId: string, roomId: string, messageId: string) {
+  await roomAccess(userId, roomId, P.READ_HISTORY);
+  const target = await db.message.findFirst({ where: { id: messageId, roomId } });
+  assert(target, 404, 'This message is no longer available in the conversation.');
+  const [older, newer] = await Promise.all([
+    db.message.findMany({
+      where: { roomId, seq: { lt: target.seq } },
+      orderBy: { seq: 'desc' },
+      take: 25,
+      include: messageInclude,
+    }),
+    db.message.findMany({
+      where: { roomId, seq: { gte: target.seq } },
+      orderBy: { seq: 'asc' },
+      take: 26,
+      include: messageInclude,
+    }),
+  ]);
+  const messages = [...older.reverse(), ...newer];
+  return {
+    messages,
+    hasMore: older.length === 25,
+    hasNewer: newer.length === 26,
+    olderCursor: messages[0]?.seq,
+    newerCursor: messages.at(-1)?.seq,
+  };
+}
+export async function sendStatus(userId: string, roomId: string, nonce: string) {
+  await roomAccess(userId, roomId); // Author scoped; no READ_HISTORY requirement.
+  const message = await db.message.findUnique({
+    where: { authorId_roomId_nonce: { authorId: userId, roomId, nonce } },
+    include: messageInclude,
+  });
+  return { status: message ? 'sent' : 'not-found', message };
+}
+export async function mentionHistory(userId: string, before?: string) {
+  const { rooms } = await accessibleRooms(userId);
+  const messages = await db.message.findMany({
+    where: {
+      roomId: { in: rooms.filter((r) => has(r.permissions, P.READ_HISTORY)).map((r) => r.id) },
+      deletedAt: null,
+      mentions: { some: { userId } },
+      ...(before ? { seq: { lt: BigInt(before) } } : {}),
+    },
+    orderBy: { seq: 'desc' },
+    take: 50,
+    include: messageInclude,
+  });
+  return { messages, nextCursor: messages.length === 50 ? messages.at(-1)?.seq : null };
+}
+export async function notificationMessages(
+  userId: string,
+  after: string,
+  afterEvent?: string,
+  untilEvent?: string,
+) {
+  const { rooms } = await accessibleRooms(userId);
+  const roomIds = rooms.filter((r) => has(r.permissions, P.READ_HISTORY)).map((r) => r.id);
+  const events = afterEvent
+    ? await db.event.findMany({
+        where: {
+          id: { gt: BigInt(afterEvent), ...(untilEvent ? { lte: BigInt(untilEvent) } : {}) },
+          scope: 'room',
+          type: 'messages',
+          messageId: { not: null },
+          targetId: { in: roomIds },
+        },
+        orderBy: { id: 'asc' },
+        take: 101,
+        select: { id: true, messageId: true },
+      })
+    : null;
+  const page = events?.slice(0, 100);
+  const messages = await db.message.findMany({
+    where: {
+      roomId: { in: roomIds },
+      ...(page ? { id: { in: page.map((e) => e.messageId!) } } : { seq: { gt: BigInt(after) } }),
+      authorId: { not: userId },
+      deletedAt: null,
+      OR: [{ mentions: { some: { userId } } }, { room: { kind: { not: 'TEXT' } } }],
+    },
+    orderBy: { seq: 'asc' },
+    take: 100,
+    include: messageInclude,
+  });
+  return events
+    ? {
+        messages,
+        nextCursor: page?.at(-1)?.id.toString() ?? untilEvent ?? afterEvent!,
+        hasMore: events.length > 100,
+      }
+    : messages;
+}
+
+export async function cancelSend(userId: string, roomId: string, nonce: string) {
+  return roomTransaction(roomId, async (tx) => {
+    await roomAccess(userId, roomId, P.VIEW_CHANNEL, tx);
+    const key = { authorId: userId, roomId, nonce };
+    const message = await tx.message.findUnique({
+      where: { authorId_roomId_nonce: key },
+      include: messageInclude,
+    });
+    if (message) return { status: 'sent', message };
+    await tx.sendCancellation.upsert({
+      where: { authorId_roomId_nonce: key },
+      create: key,
+      update: {},
+    });
+    return { status: 'cancelled', message: null };
   });
 }

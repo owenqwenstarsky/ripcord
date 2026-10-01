@@ -1,8 +1,14 @@
 import { randomBytes } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import { db } from './db';
-import { assert } from './errors';
-import { requireServerPermission, serverAccess, targetMember, canDm } from './access';
+import { assert, AppError } from './errors';
+import {
+  requireServerPermission,
+  serverAccess,
+  targetMember,
+  canDm,
+  accessibleRooms,
+} from './access';
 import { ALL, DEFAULT, P, has } from './permissions';
 import { lock, audit, event } from './chat';
 import { personSelect } from './auth';
@@ -87,17 +93,12 @@ export async function serverDetails(userId: string, serverId: string) {
     include: { overrides: true },
     orderBy: { position: 'asc' },
   });
-  const manager = has(access.permissions, P.MANAGE_CHANNELS | P.MANAGE_ROLES);
-  const { roomAccess } = await import('./access');
-  const visible = [];
-  for (const room of rooms) {
-    try {
-      await roomAccess(userId, room.id);
-      visible.push(manager ? room : { ...room, overrides: undefined });
-    } catch {
-      /* omit private channels */
-    }
-  }
+  const manager = (access.permissions & (P.MANAGE_CHANNELS | P.MANAGE_ROLES)) !== 0n;
+  const snapshot = await accessibleRooms(userId);
+  const visibleIds = new Set(snapshot.rooms.map((r) => r.id));
+  const visible = rooms
+    .filter((r) => visibleIds.has(r.id))
+    .map((room) => (manager ? room : { ...room, overrides: undefined }));
   return {
     ...access.server,
     permissions: access.permissions,
@@ -173,8 +174,11 @@ export async function categoryMutation(
         await tx.room.update({ where: { id: room.id }, data: { synchronized: false } });
       }
       await tx.category.delete({ where: { id: categoryId! } });
-    } else if (categoryId) await tx.category.update({ where: { id: categoryId }, data });
-    else {
+    } else if (categoryId) {
+      if (data.position !== undefined)
+        data.position = await reorderPositions(tx, 'category', serverId, categoryId, data.position);
+      await tx.category.update({ where: { id: categoryId }, data });
+    } else {
       assert(data.name, 400, 'Category name is required.');
       await tx.category.create({ data: { ...data, name: data.name, serverId } });
     }
@@ -215,11 +219,14 @@ export async function channelMutation(
     let result;
     if (remove) await tx.room.delete({ where: { id: roomId! } });
     else if (roomId) {
+      const current = await tx.room.findUniqueOrThrow({
+        where: { id: roomId },
+        include: { category: { include: { overrides: true } } },
+      });
+      const moving = values.categoryId !== undefined && values.categoryId !== current.categoryId;
+      // A category move never implicitly adopts the destination permissions.
+      if (moving) values.synchronized = false;
       if (values.synchronized === false) {
-        const current = await tx.room.findUniqueOrThrow({
-          where: { id: roomId },
-          include: { category: { include: { overrides: true } } },
-        });
         if (current.synchronized && current.category) {
           await tx.permissionOverride.deleteMany({ where: { roomId } });
           await tx.permissionOverride.createMany({
@@ -233,17 +240,36 @@ export async function channelMutation(
           });
         }
       }
-      if (values.synchronized) await tx.permissionOverride.deleteMany({ where: { roomId } });
+      if (values.synchronized) {
+        assert(
+          values.categoryId ?? current.categoryId,
+          400,
+          'Choose a category before synchronizing.',
+        );
+        await tx.permissionOverride.deleteMany({ where: { roomId } });
+      }
+      if (values.position !== undefined && values.position !== current.position)
+        values.position = await reorderPositions(tx, 'room', serverId, roomId, values.position);
       result = await tx.room.update({ where: { id: roomId }, data: values });
     } else {
       assert(values.name, 400, 'Channel name is required.');
       result = await tx.room.create({ data: { ...values, name: values.name, serverId } });
       if (privateRoleId) {
-        await requireServerPermission(userId, serverId, P.MANAGE_ROLES, tx);
+        const actor = await requireServerPermission(userId, serverId, P.MANAGE_ROLES, tx);
         const role = await tx.role.findFirst({
           where: { id: privateRoleId, serverId, everyone: false },
         });
         assert(role, 400, 'Choose a role from this server.');
+        assert(
+          actor.owner || role.position < actor.position,
+          403,
+          'You can only create overrides for roles below your highest role.',
+        );
+        assert(
+          has(actor.permissions, P.VIEW_CHANNEL),
+          403,
+          'You cannot override permissions you do not have.',
+        );
         const everyone = await tx.role.findFirstOrThrow({ where: { serverId, everyone: true } });
         await tx.room.update({ where: { id: result.id }, data: { synchronized: false } });
         await tx.permissionOverride.createMany({
@@ -357,11 +383,6 @@ export async function setOverride(
       400,
       'Invalid or conflicting permission overrides.',
     );
-    assert(
-      actor.owner || ((allow | deny) & ~actor.permissions) === 0n,
-      403,
-      'You cannot override permissions you do not have.',
-    );
     if (scope === 'room') {
       const room = await tx.room.findUniqueOrThrow({
         where: { id },
@@ -386,6 +407,15 @@ export async function setOverride(
       targetType: input.targetType,
       targetId: input.targetId,
     };
+    const existing = await tx.permissionOverride.findFirst({ where });
+    const changed =
+      ((remove ? 0n : allow) ^ (existing?.allow ?? 0n)) |
+      ((remove ? 0n : deny) ^ (existing?.deny ?? 0n));
+    assert(
+      actor.owner || (changed & ~actor.permissions) === 0n,
+      403,
+      'You cannot change overrides for permissions you do not have.',
+    );
     await tx.permissionOverride.deleteMany({ where });
     if (!remove) await tx.permissionOverride.create({ data: { ...where, allow, deny } });
     await audit(tx, userId, serverId, 'permissions.update', id);
@@ -508,7 +538,13 @@ export async function createDm(userId: string, userIds: string[], name = '') {
   const directKey = ids.length === 2 ? ids.sort().join(':') : undefined;
   return db.$transaction(async (tx) => {
     await lock(tx, directKey ? `direct:${directKey}` : `group:${userId}`);
-    for (const id of ids.filter((id) => id !== userId)) await canDm(userId, id, tx);
+    if (directKey)
+      await canDm(
+        userId,
+        ids.find((id) => id !== userId)!,
+        tx,
+      );
+    else for (const from of ids) for (const to of ids) if (from !== to) await canDm(from, to, tx);
     if (directKey) {
       const existing = await tx.room.findUnique({ where: { directKey } });
       if (existing) return existing;
@@ -525,4 +561,34 @@ export async function createDm(userId: string, userIds: string[], name = '') {
     for (const id of ids) await event(tx, 'user', id, 'conversations');
     return room;
   });
+}
+
+async function reorderPositions(
+  tx: Prisma.TransactionClient,
+  kind: 'room' | 'category',
+  serverId: string,
+  targetId: string,
+  position: number,
+) {
+  const entities =
+    kind === 'room'
+      ? await tx.room.findMany({
+          where: { serverId, kind: 'TEXT' },
+          orderBy: [{ position: 'asc' }, { id: 'asc' }],
+        })
+      : await tx.category.findMany({
+          where: { serverId },
+          orderBy: [{ position: 'asc' }, { id: 'asc' }],
+        });
+  const target = entities.find((e) => e.id === targetId)!;
+  const ordered = entities.filter((e) => e.id !== targetId);
+  const index = Math.min(position, ordered.length);
+  ordered.splice(index, 0, target);
+  for (let i = 0; i < ordered.length; i++)
+    if (ordered[i].id !== targetId && ordered[i].position !== i) {
+      if (kind === 'room')
+        await tx.room.update({ where: { id: ordered[i].id }, data: { position: i } });
+      else await tx.category.update({ where: { id: ordered[i].id }, data: { position: i } });
+    }
+  return index;
 }
