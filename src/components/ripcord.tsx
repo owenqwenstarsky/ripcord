@@ -86,11 +86,23 @@ type Pending = {
 };
 function RipCordApp() {
   const qc = useQueryClient();
+  const [accountReset, setAccountReset] = useState<boolean | null>(null);
   const publicInfo = useQuery({ queryKey: ['public'], queryFn: () => api<PublicInfo>('public') });
   const data = useQuery({
     queryKey: ['workspace'],
-    queryFn: () => api<Workspace>('workspace'),
-    refetchInterval: 30000,
+    queryFn: async (): Promise<Workspace | null> => {
+      try {
+        return await api<Workspace>('workspace');
+      } catch (error) {
+        // Signed out is a stable result, so refetching cannot reset the authentication form.
+        if ((error as Error & { status?: number }).status === 401) return null;
+        throw error;
+      }
+    },
+    enabled: accountReset === false,
+    refetchInterval: (query) => (query.state.data ? 30000 : false),
+    refetchOnWindowFocus: (query) => !!query.state.data,
+    refetchOnReconnect: (query) => !!query.state.data,
     retry: false,
   });
   const [serverId, setServerId] = useState<string | null>(null),
@@ -99,7 +111,6 @@ function RipCordApp() {
   const [modal, setModal] = useState(''),
     [error, setError] = useState(''),
     [notice, setNotice] = useState('');
-  const [accountReset, setAccountReset] = useState(false);
   const [showMembers, setShowMembers] = useState(true),
     [navOpen, setNavOpen] = useState(false),
     [theme, setTheme] = useState('dark');
@@ -446,14 +457,14 @@ function RipCordApp() {
       setSelectedUser(null);
     });
   }
-  if (data.isPending || publicInfo.isPending)
-    return (
-      <div className="loading-screen">
-        <Logo />
-        <LoaderCircle className="spin" size={25} />
-        <span>Finding your conversations…</span>
-      </div>
-    );
+  const loadingScreen = (
+    <div className="loading-screen">
+      <Logo />
+      <LoaderCircle className="spin" size={25} />
+      <span>Finding your conversations…</span>
+    </div>
+  );
+  if (publicInfo.isPending) return loadingScreen;
   if (!publicInfo.data)
     return (
       <div className="loading-screen">
@@ -464,26 +475,22 @@ function RipCordApp() {
         </button>
       </div>
     );
-  if (accountReset && publicInfo.data)
+  if (accountReset || workspace === null)
     return (
       <AuthScreen
         info={publicInfo.data}
         onLogin={() => {
-          setAccountReset(false);
-          void qc.invalidateQueries({ queryKey: ['workspace'] });
+          setInitialized(false);
+          // Explicit refetch also works while the reset flow has automatic fetching paused.
+          void data.refetch().then((result) => {
+            if (result.data) setAccountReset(false);
+          });
         }}
       />
     );
+  if (data.isPending) return loadingScreen;
   if (!workspace)
-    return (data.error as Error & { status?: number })?.status === 401 ? (
-      <AuthScreen
-        info={publicInfo.data}
-        onLogin={() => {
-          setInitialized(false);
-          void qc.invalidateQueries({ queryKey: ['workspace'] });
-        }}
-      />
-    ) : (
+    return (
       <div className="loading-screen">
         <Logo />
         <ErrorNote error={data.error?.message} />
