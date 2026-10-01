@@ -43,6 +43,7 @@ import {
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { P, has } from '@/lib/permissions';
+import { createMessageNonce } from '@/lib/message-nonce';
 import type { ChatMessage, ChatRoom, Community, Person, Workspace } from '@/lib/types';
 import { AuthScreen } from './auth-screen';
 import { api, Logo, Avatar, Modal, Menu, MenuItem, ErrorNote, Empty } from './ui';
@@ -397,7 +398,7 @@ function RipCordApp() {
     )
       return;
     const p = {
-      nonce: crypto.randomUUID(),
+      nonce: createMessageNonce(),
       roomId: room.id,
       content,
       attachmentIds: files.map((f) => f.id),
