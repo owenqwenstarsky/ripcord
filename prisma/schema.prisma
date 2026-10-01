@@ -1,0 +1,316 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum RoomKind {
+  TEXT
+  DIRECT
+  GROUP
+}
+
+enum RelationshipKind {
+  REQUEST
+  FRIEND
+  BLOCK
+}
+
+model User {
+  id            String         @id @default(cuid())
+  username      String         @unique
+  displayName   String
+  passwordHash  String
+  avatarId      String?
+  email         String?        @unique
+  emailVerified Boolean        @default(false)
+  friendsOnly   Boolean        @default(false)
+  isAdmin       Boolean        @default(false)
+  suspended     Boolean        @default(false)
+  createdAt     DateTime       @default(now())
+  sessions      Session[]
+  recoveryCodes RecoveryCode[]
+  tokens        AccountToken[]
+  memberships   Membership[]
+  roomMembers   RoomMember[]
+  messages      Message[]
+  reactions     Reaction[]
+  attachments   Attachment[]
+  reads         ReadPosition[]
+}
+
+model Session {
+  id        String   @id
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model RecoveryCode {
+  hash   String @id
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model AccountToken {
+  hash      String   @id
+  userId    String
+  purpose   String
+  email     String?
+  expiresAt DateTime
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Instance {
+  id                 String  @id @default("instance")
+  name               String  @default("RipCord")
+  publicRegistration Boolean @default(false)
+  maxFileBytes       Int     @default(26214400)
+  maxAttachments     Int     @default(5)
+  maxMessageLength   Int     @default(2000)
+  maxStorageBytes    BigInt  @default(10737418240)
+}
+
+model Server {
+  id          String       @id @default(cuid())
+  name        String
+  description String       @default("")
+  icon        String       @default("")
+  ownerId     String
+  createdAt   DateTime     @default(now())
+  members     Membership[]
+  roles       Role[]
+  categories  Category[]
+  rooms       Room[]
+  invites     Invite[]
+  bans        Ban[]
+  audit       AuditLog[]
+}
+
+model Membership {
+  id           String       @id @default(cuid())
+  userId       String
+  serverId     String
+  nickname     String?
+  timeoutUntil DateTime?
+  joinedAt     DateTime     @default(now())
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  server       Server       @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  roles        MemberRole[]
+
+  @@unique([userId, serverId])
+}
+
+model Role {
+  id          String       @id @default(cuid())
+  serverId    String
+  name        String
+  color       String       @default("#9ca3af")
+  position    Int          @default(0)
+  permissions BigInt       @default(0)
+  everyone    Boolean      @default(false)
+  server      Server       @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  members     MemberRole[]
+
+  @@index([serverId])
+}
+
+model MemberRole {
+  memberId String
+  roleId   String
+  member   Membership @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  role     Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([memberId, roleId])
+}
+
+model Category {
+  id        String               @id @default(cuid())
+  serverId  String
+  name      String
+  position  Int                  @default(0)
+  server    Server               @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  rooms     Room[]
+  overrides PermissionOverride[]
+}
+
+model Room {
+  id           String               @id @default(cuid())
+  kind         RoomKind             @default(TEXT)
+  serverId     String?
+  categoryId   String?
+  name         String
+  topic        String               @default("")
+  position     Int                  @default(0)
+  synchronized Boolean              @default(true)
+  slowMode     Int                  @default(0)
+  ownerId      String?
+  directKey    String?              @unique
+  createdAt    DateTime             @default(now())
+  server       Server?              @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  category     Category?            @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  members      RoomMember[]
+  messages     Message[]
+  overrides    PermissionOverride[]
+  reads        ReadPosition[]
+
+  @@index([serverId, position])
+}
+
+model RoomMember {
+  roomId String
+  userId String
+  room   Room   @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([roomId, userId])
+}
+
+model PermissionOverride {
+  id         String    @id @default(cuid())
+  roomId     String?
+  categoryId String?
+  targetType String
+  targetId   String
+  allow      BigInt    @default(0)
+  deny       BigInt    @default(0)
+  room       Room?     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([roomId, targetType, targetId])
+  @@unique([categoryId, targetType, targetId])
+}
+
+model Message {
+  id          String       @id @default(cuid())
+  seq         BigInt       @unique @default(autoincrement())
+  roomId      String
+  authorId    String
+  content     String?
+  nonce       String
+  replyId     String?
+  editedAt    DateTime?
+  deletedAt   DateTime?
+  createdAt   DateTime     @default(now())
+  room        Room         @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  author      User         @relation(fields: [authorId], references: [id])
+  reply       Message?     @relation("Replies", fields: [replyId], references: [id], onDelete: SetNull)
+  replies     Message[]    @relation("Replies")
+  attachments Attachment[]
+  reactions   Reaction[]
+
+  @@unique([authorId, roomId, nonce])
+  @@index([roomId, seq])
+}
+
+model Reaction {
+  messageId String
+  userId    String
+  emoji     String
+  message   Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([messageId, userId, emoji])
+}
+
+model Attachment {
+  id        String   @id @default(cuid())
+  ownerId   String
+  messageId String?
+  name      String
+  mime      String
+  size      Int
+  path      String   @unique
+  createdAt DateTime @default(now())
+  owner     User     @relation(fields: [ownerId], references: [id])
+  message   Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+}
+
+model ReadPosition {
+  userId String
+  roomId String
+  seq    BigInt @default(0)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  room   Room   @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roomId])
+}
+
+model Relationship {
+  id     String           @id @default(cuid())
+  fromId String
+  toId   String
+  kind   RelationshipKind
+
+  @@unique([fromId, toId, kind])
+  @@index([toId])
+}
+
+model Invite {
+  code      String    @id
+  serverId  String?
+  creatorId String
+  expiresAt DateTime?
+  maxUses   Int?
+  uses      Int       @default(0)
+  revoked   Boolean   @default(false)
+  server    Server?   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+}
+
+model Ban {
+  serverId String
+  userId   String
+  reason   String
+  server   Server @relation(fields: [serverId], references: [id], onDelete: Cascade)
+
+  @@id([serverId, userId])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  serverId  String?
+  actorId   String
+  action    String
+  targetId  String?
+  detail    Json     @default("{}")
+  createdAt DateTime @default(now())
+  server    Server?  @relation(fields: [serverId], references: [id], onDelete: Cascade)
+
+  @@index([serverId, createdAt])
+}
+
+model Report {
+  id         String    @id @default(cuid())
+  reporterId String
+  messageId  String
+  serverId   String?
+  reason     String
+  resolvedAt DateTime?
+  resolvedBy String?
+  createdAt  DateTime  @default(now())
+
+  @@index([serverId, resolvedAt])
+}
+
+model Event {
+  id          BigInt    @id @default(autoincrement())
+  scope       String
+  targetId    String
+  type        String
+  createdAt   DateTime  @default(now())
+  deliveredAt DateTime?
+
+  @@index([deliveredAt, id])
+}
+
+model RateBucket {
+  key       String   @id
+  count     Int      @default(1)
+  expiresAt DateTime
+}

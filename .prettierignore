@@ -1,0 +1,9 @@
+node_modules
+.next
+dist
+package-lock.json
+prisma/migrations
+LICENSE
+uploads
+
+next-env.d.ts

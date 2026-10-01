@@ -1,0 +1,37 @@
+name: ripcord
+services:
+  db:
+    image: postgres:17.10-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ripcord
+      POSTGRES_DB: ripcord
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ripcord -d ripcord']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  app:
+    build: .
+    restart: unless-stopped
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - '127.0.0.1:${HOST_PORT:-3000}:3000'
+    environment:
+      DATABASE_URL: postgresql://ripcord:${POSTGRES_PASSWORD}@db:5432/ripcord?connection_limit=10
+      APP_URL: ${APP_URL:-http://localhost:3000}
+      ALLOW_INSECURE_HTTP: ${ALLOW_INSECURE_HTTP:-0}
+      TRUST_PROXY: ${TRUST_PROXY:-0}
+      SMTP_URL: ${SMTP_URL:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+    volumes:
+      - uploads:/app/uploads
+volumes:
+  postgres:
+  uploads:
