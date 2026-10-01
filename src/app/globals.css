@@ -1362,31 +1362,25 @@ h3 {
   color: var(--muted);
   margin-top: 4px;
 }
-.pending-message {
-  display: flex;
-  gap: 14px;
-  padding: 12px 26px;
-  opacity: 0.6;
-}
-.pending-message.failed {
-  opacity: 1;
-}
-.pending-message > div {
-  flex: 1;
-}
-.pending-message strong {
+.pending-message .message-byline strong {
   font-size: 13px;
+  font-weight: 600;
 }
 .pending-message p {
   font-size: 13px;
+  color: var(--secondary);
   white-space: pre-wrap;
-  margin: 5px 0;
+  overflow-wrap: anywhere;
+  margin: 0;
+  transition: color 0.16s;
 }
-.pending-message span {
+.pending-message.failed p {
+  color: var(--text);
+}
+.pending-message-error {
+  display: block;
+  margin-top: 4px;
   font-size: 10px;
-  color: var(--muted);
-}
-.pending-message.failed span {
   color: var(--danger);
 }
 .pending-message .text-button {

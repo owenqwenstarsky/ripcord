@@ -944,13 +944,20 @@ function RipCordApp() {
                 {pending
                   .filter((p) => p.roomId === roomId)
                   .map((p) => (
-                    <div className={`pending-message ${p.failed ? 'failed' : ''}`} key={p.nonce}>
+                    <div
+                      className={`message pending-message ${p.failed ? 'failed' : ''}`}
+                      key={p.nonce}
+                      aria-label={p.failed ? 'Message failed to send' : 'Sending message'}
+                      aria-busy={!p.failed}
+                    >
                       <Avatar user={user!} />
-                      <div>
-                        <strong>{user!.displayName}</strong>
+                      <div className="message-content">
+                        <div className="message-byline">
+                          <strong>{user!.displayName}</strong>
+                        </div>
                         <p>{p.content || `${p.attachmentIds.length} attachment(s)`}</p>
-                        {p.failed ? (
-                          <span>
+                        {p.failed && (
+                          <span className="pending-message-error">
                             {p.error}{' '}
                             <button className="text-button" onClick={() => void transmit(p)}>
                               Retry
@@ -964,8 +971,6 @@ function RipCordApp() {
                               Dismiss
                             </button>
                           </span>
-                        ) : (
-                          <span>Sending…</span>
                         )}
                       </div>
                     </div>
