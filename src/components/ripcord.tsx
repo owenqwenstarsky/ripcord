@@ -1905,7 +1905,20 @@ function Message({
           </span>
         </div>
       )}
-      <article className={`message ${grouped ? 'grouped' : ''} ${m.deletedAt ? 'deleted' : ''}`}>
+      <article
+        className={`message ${grouped ? 'grouped' : ''} ${m.reply ? 'has-reply' : ''} ${m.deletedAt ? 'deleted' : ''}`}
+      >
+        {m.reply && (
+          <div className="message-reply">
+            <Reply size={13} />
+            <strong>{m.reply.author.displayName}</strong>
+            <span>
+              {m.reply.deletedAt
+                ? 'Original message deleted'
+                : m.reply.content?.slice(0, 120) || 'Attachment'}
+            </span>
+          </div>
+        )}
         {!grouped ? (
           <Avatar user={m.author} onClick={onProfile} />
         ) : (
@@ -1914,17 +1927,6 @@ function Message({
           </time>
         )}
         <div className="message-content">
-          {m.reply && (
-            <div className="message-reply">
-              <Reply size={13} />
-              <strong>{m.reply.author.displayName}</strong>
-              <span>
-                {m.reply.deletedAt
-                  ? 'Original message deleted'
-                  : m.reply.content?.slice(0, 120) || 'Attachment'}
-              </span>
-            </div>
-          )}
           {!grouped && (
             <div className="message-byline">
               <button onClick={onProfile}>{m.author.displayName}</button>
