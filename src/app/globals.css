@@ -1190,6 +1190,20 @@ h3 {
 .message:hover {
   background: #0000000c;
 }
+.message.has-reply {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  row-gap: 7px;
+  align-items: start;
+}
+.message.has-reply > .avatar {
+  grid-column: 1;
+  grid-row: 2;
+}
+.message.has-reply > .message-content {
+  grid-column: 2;
+  grid-row: 2;
+}
 .message.grouped {
   margin-top: 0;
   padding-top: 2px;
@@ -1221,13 +1235,17 @@ h3 {
   color: var(--muted);
 }
 .message-reply {
+  grid-column: 2;
+  grid-row: 1;
   display: flex;
   gap: 6px;
   align-items: center;
   font-size: 10px;
   color: var(--muted);
-  margin-bottom: 7px;
   position: relative;
+}
+.message-reply > svg {
+  flex-shrink: 0;
 }
 .message-reply:before {
   position: absolute;
