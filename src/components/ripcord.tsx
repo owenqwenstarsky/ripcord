@@ -1168,9 +1168,6 @@ function RipCordApp() {
                     )
                   );
                 })}
-                <div className="member-footer">
-                  <span className="live-dot" /> A space of your own.
-                </div>
               </aside>
             )}
           </div>

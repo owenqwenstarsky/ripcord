@@ -1733,20 +1733,6 @@ h3 {
   color: #d3b56d;
   font-size: 13px;
 }
-.member-footer {
-  border-top: 1px solid var(--line);
-  padding: 17px 7px;
-  color: var(--muted);
-  font-size: 9px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 40px;
-}
-.member-footer .live-dot {
-  width: 4px;
-  height: 4px;
-}
 .members-close {
   display: none;
 }
